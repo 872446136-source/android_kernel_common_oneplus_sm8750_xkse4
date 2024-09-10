@@ -1428,6 +1428,7 @@ static void z_erofs_fill_bio_vec(struct bio_vec *bvec,
 	struct z_erofs_bvec zbv;
 	struct address_space *mapping;
 	struct folio *folio;
+	struct page *page;
 	int bs = i_blocksize(f->inode);
 
 	/* Except for inplace folios, the entire folio can be used for I/Os */
@@ -1450,7 +1451,6 @@ repeat:
 	 * file-backed folios will be used instead.
 	 */
 	if (folio->private == (void *)Z_EROFS_PREALLOCATED_PAGE) {
-		folio->private = 0;
 		tocache = true;
 		goto out_tocache;
 	}
@@ -1477,7 +1477,6 @@ repeat:
 			/* compressed_bvecs[] already takes a ref before */
 			folio_put(folio);
 		}
-
 		if (likely(folio->private == (void *)pcl)) {
 			/* don't submit cache I/Os again if already uptodate */
 			if (folio_test_uptodate(folio)) {
@@ -1486,38 +1485,37 @@ repeat:
 			}
 			return;
 		}
-
 		/*
 		 * Already linked with another pcluster, which only appears in
 		 * crafted images by fuzzers for now.  But handle this anyway.
 		 */
-		tocache = false;	/* use temporary short-lived folios */
+		tocache = false;	/* use temporary short-lived pages */
 	} else {
 		DBG_BUGON(1); /* referenced managed folios can't be truncated */
 		tocache = true;
 	}
-
 	folio_unlock(folio);
 	folio_put(folio);
 out_allocfolio:
-	zbv.page = __erofs_allocpage(&f->pagepool,
-				     gfp | __GFP_NOFAIL, true);
+	page = __erofs_allocpage(&f->pagepool,
+				 gfp | __GFP_NOFAIL, true);
 	spin_lock(&pcl->obj.lockref.lock);
-	if (pcl->compressed_bvecs[nr].page) {
-		erofs_pagepool_add(&f->pagepool, zbv.page);
+	if (unlikely(pcl->compressed_bvecs[nr].page != zbv.page)) {
+		erofs_pagepool_add(&f->pagepool, page);
 		spin_unlock(&pcl->obj.lockref.lock);
 		cond_resched();
 		goto repeat;
 	}
-	bvec->bv_page = pcl->compressed_bvecs[nr].page = zbv.page;
-	folio = page_folio(zbv.page);
-	/* first mark it as a temporary shortlived folio (now 1 ref) */
-	folio->private = (void *)Z_EROFS_SHORTLIVED_PAGE;
+	bvec->bv_page = pcl->compressed_bvecs[nr].page = page;
+	folio = page_folio(page);
 	spin_unlock(&pcl->obj.lockref.lock);
 out_tocache:
 	if (!tocache || bs != PAGE_SIZE ||
-	    filemap_add_folio(mc, folio, pcl->obj.index + nr, gfp))
+	    filemap_add_folio(mc, folio, pcl->obj.index + nr, gfp)) {
+		/* turn into a temporary shortlived folio (1 ref) */
+		folio->private = (void *)Z_EROFS_SHORTLIVED_PAGE;
 		return;
+	}
 	folio_attach_private(folio, pcl);
 	/* drop a refcount added by allocpage (then 2 refs in total here) */
 	folio_put(folio);
@@ -1651,24 +1649,30 @@ static void z_erofs_submit_queue(struct z_erofs_decompress_frontend *f,
 		cur = mdev.m_pa;
 		end = cur + pcl->pclustersize;
 		do {
-			z_erofs_fill_bio_vec(&bvec, f, pcl, i++, mc);
-			if (!bvec.bv_page)
-				continue;
-
+			bvec.bv_page = NULL;
 			if (bio && (cur != last_pa ||
 				    last_bdev != mdev.m_bdev)) {
-submit_bio_retry:
-                                //#ifdef OPLUS_STORAGE_FS debug for bugid 7760993
+drain_io:
+				//#ifdef OPLUS_STORAGE_FS debug for bugid 7760993
 				if (!bio->bi_iter.bi_size)
 					WARN(1, "erofs submit empty io, bio=0x%p, bi_opf=0x%x, bi_sector=%llu\n",
 					     bio, bio->bi_opf, bio->bi_iter.bi_sector);
-                                //#endif
+				//#endif
 				submit_bio(bio);
 				if (memstall) {
 					psi_memstall_leave(&pflags);
 					memstall = 0;
 				}
 				bio = NULL;
+			}
+
+			if (!bvec.bv_page) {
+				z_erofs_fill_bio_vec(&bvec, f, pcl, i++, mc);
+				if (!bvec.bv_page)
+					continue;
+				if (cur + bvec.bv_len > end)
+					bvec.bv_len = end - cur;
+				DBG_BUGON(bvec.bv_len < sb->s_blocksize);
 			}
 
 			if (unlikely(PageWorkingset(bvec.bv_page)) &&
@@ -1689,17 +1693,9 @@ submit_bio_retry:
 				last_bdev = mdev.m_bdev;
 			}
 
-			if (cur + bvec.bv_len > end)
-				bvec.bv_len = end - cur;
-			//#ifdef OPLUS_STORAGE_FS debug for bugid 7760993.origin code is DBG_BUGON
-			BUG_ON(bvec.bv_len < sb->s_blocksize);
-			//#else
-			//DBG_BUGON(bvec.bv_len < sb->s_blocksize);
-			//#endif
 			if (!bio_add_page(bio, bvec.bv_page, bvec.bv_len,
 					  bvec.bv_offset))
-				goto submit_bio_retry;
-
+				goto drain_io;
 			last_pa = cur + bvec.bv_len;
 			bypass = false;
 		} while ((cur += bvec.bv_len) < end);
