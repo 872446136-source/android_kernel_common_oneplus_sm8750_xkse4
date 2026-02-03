@@ -860,7 +860,28 @@ static int z_erofs_pcluster_begin(struct z_erofs_decompress_frontend *fe)
 	/* must be Z_EROFS_PCLUSTER_TAIL or pointed to previous pcluster */
 	DBG_BUGON(fe->owned_head == Z_EROFS_PCLUSTER_NIL);
 
-	if (!(map->m_flags & EROFS_MAP_META)) {
+	/*
+	 * Inline compressed data must be successfully read before the new
+	 * pcluster is allocated and linked into the decompression chain.
+	 * Otherwise an interrupted metadata read can leave a chained pcluster
+	 * with compressed_bvecs[0].page == NULL.
+	 */
+	if (map->m_flags & EROFS_MAP_META) {
+		void *mptr;
+
+		if ((map->m_pa & ~PAGE_MASK) + map->m_plen > PAGE_SIZE) {
+			DBG_BUGON(1);
+			return -EFSCORRUPTED;
+		}
+
+		mptr = erofs_read_metabuf(&map->buf, sb, blknr,
+					 EROFS_NO_KMAP);
+		if (IS_ERR(mptr)) {
+			ret = PTR_ERR(mptr);
+			erofs_err(sb, "failed to get inline data %d", ret);
+			return ret;
+		}
+	} else {
 		while (1) {
 			rcu_read_lock();
 			pcl = xa_load(&EROFS_SB(sb)->managed_pslots, blknr);
@@ -871,9 +892,6 @@ static int z_erofs_pcluster_begin(struct z_erofs_decompress_frontend *fe)
 			}
 			rcu_read_unlock();
 		}
-	} else if ((map->m_pa & ~PAGE_MASK) + map->m_plen > PAGE_SIZE) {
-		DBG_BUGON(1);
-		return -EFSCORRUPTED;
 	}
 
 	if (pcl) {
@@ -896,19 +914,18 @@ static int z_erofs_pcluster_begin(struct z_erofs_decompress_frontend *fe)
 		/* bind cache first when cached decompression is preferred */
 		z_erofs_bind_cache(fe);
 	} else {
-		void *mptr;
-
-		mptr = erofs_read_metabuf(&map->buf, sb, blknr, EROFS_NO_KMAP);
-		if (IS_ERR(mptr)) {
-			ret = PTR_ERR(mptr);
-			erofs_err(sb, "failed to get inline data %d", ret);
-			return ret;
-		}
+		/*
+		 * erofs_read_metabuf() above already guaranteed that the
+		 * inline compressed page is valid before this pcluster became
+		 * visible to the decompression chain.
+		 */
 		get_page(map->buf.page);
-		WRITE_ONCE(fe->pcl->compressed_bvecs[0].page, map->buf.page);
+		WRITE_ONCE(fe->pcl->compressed_bvecs[0].page,
+			   map->buf.page);
 		fe->pcl->pageofs_in = map->m_pa & ~PAGE_MASK;
 		fe->mode = Z_EROFS_PCLUSTER_FOLLOWED_NOINPLACE;
 	}
+
 	/* file-backed inplace I/O pages are traversed in reverse order */
 	fe->icur = z_erofs_pclusterpages(fe->pcl);
 	return 0;
