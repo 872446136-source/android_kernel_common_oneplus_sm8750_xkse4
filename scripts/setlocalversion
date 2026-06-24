@@ -62,7 +62,7 @@ scm_version()
 		case "$1" in
 		--short)
 			short=true;;
-		--no-dirty)
+		--no)
 			no_dirty=true;;
 		esac
 		shift
@@ -134,7 +134,7 @@ scm_version()
 	# Check for uncommitted changes.
 	# This script must avoid any write attempt to the source tree, which
 	# might be read-only.
-	# You cannot use 'git describe --dirty' because it tries to create
+	# You cannot use 'git describe -' because it tries to create
 	# .git/index.lock .
 	# First, with git-status, but --no-optional-locks is only supported in
 	# git >= 2.14, so fall back to git-diff-index if it fails. Note that
@@ -145,7 +145,7 @@ scm_version()
 		git --no-optional-locks status -uno --porcelain 2>/dev/null ||
 		git diff-index --name-only HEAD
 	} | read dummy; then
-		printf '%s' -dirty
+		printf '%s' 
 	fi
 }
 
@@ -178,7 +178,7 @@ if test ! "$srctree" -ef .; then
 fi
 
 if ${no_local}; then
-	echo "${KERNELVERSION}$(scm_version --no-dirty)"
+	echo "${KERNELVERSION}$(scm_version --no)"
 	exit 0
 fi
 
