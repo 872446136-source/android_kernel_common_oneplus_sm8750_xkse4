@@ -1513,8 +1513,9 @@ out:
 	return rc;
 }
 
-static inline int try_split_folio(struct folio *folio, struct list_head *split_folios,
-				  int reason)
+static inline int try_split_folio(struct folio *folio,
+				  struct list_head *split_folios,
+				  enum migrate_mode mode, int reason)
 {
 	int rc;
 
@@ -1524,7 +1525,13 @@ static inline int try_split_folio(struct folio *folio, struct list_head *split_f
 		if (reason != MR_CONTIG_RANGE)
 			return -EBUSY;
 
-		folio_lock(folio);
+		if (mode == MIGRATE_ASYNC) {
+			if (!folio_trylock(folio))
+				return -EAGAIN;
+		} else {
+			folio_lock(folio);
+		}
+
 		rc = split_folio_to_list(folio, &head);
 		folio_unlock(folio);
 
@@ -1537,7 +1544,13 @@ static inline int try_split_folio(struct folio *folio, struct list_head *split_f
 		return rc;
 	}
 
-	folio_lock(folio);
+	if (mode == MIGRATE_ASYNC) {
+		if (!folio_trylock(folio))
+			return -EAGAIN;
+	} else {
+		folio_lock(folio);
+	}
+
 	rc = split_folio_to_list(folio, split_folios);
 	folio_unlock(folio);
 	if (!rc)
@@ -1723,9 +1736,10 @@ static int migrate_pages_batch(struct list_head *from,
 			 * use _deferred_list.
 			 */
 			if (nr_pages > 2 &&
-			   !list_empty(&folio->_deferred_list) &&
-			   folio_test_partially_mapped(folio)) {
-				if (!try_split_folio(folio, split_folios, mode)) {
+			    !list_empty(&folio->_deferred_list) &&
+			    folio_test_partially_mapped(folio)) {
+				if (!try_split_folio(folio, split_folios,
+						     mode, reason)) {
 					nr_failed++;
 					stats->nr_thp_split += is_thp;
 					continue;
@@ -1745,7 +1759,8 @@ static int migrate_pages_batch(struct list_head *from,
 			if (!thp_migration_supported() && is_thp) {
 				nr_failed++;
 				stats->nr_thp_failed++;
-				if (!try_split_folio(folio, split_folios, reason)) {
+				if (!try_split_folio(folio, split_folios,
+						     mode, reason)) {
 					stats->nr_thp_split++;
 					continue;
 				}
@@ -1776,7 +1791,8 @@ static int migrate_pages_batch(struct list_head *from,
 				stats->nr_thp_failed += is_thp;
 				/* Large folio NUMA faulting doesn't split to retry. */
 				if (folio_test_large(folio) && !nosplit) {
-					int ret = try_split_folio(folio, split_folios, reason);
+					int ret = try_split_folio(folio, split_folios,
+								  mode, reason);
 
 					if (!ret) {
 						stats->nr_thp_split += is_thp;
