@@ -12,7 +12,7 @@ CONFIG_DEFAULT_BBR=y
 CONFIG_BPF_STREAM_PARSER=y
 CONFIG_CC_OPTIMIZE_FOR_PERFORMANCE=y
 CONFIG_HEADERS_INSTALL=n
-CONFIG_LOCALVERSION="-4k-o-xkse4"
+CONFIG_LOCALVERSION="-4k-optimized"
 
 # EDIT3 -- passed
 CONFIG_IP_SET=y
@@ -88,14 +88,21 @@ CONFIG_DAMON_SYSFS=y
 CONFIG_DAMON_RECLAIM=y
 CONFIG_DAMON_LRU_SORT=y
 
-# EDIT14
+# EDIT14 -- passed
 CONFIG_NET_SCH_CAKE=y
-CONFIG_CMDLINE="console=ttynull stack_depot_disable=on cgroup_disable=pressure kasan.stacktrace=off kvm-arm.mode=protected bootconfig ioremap_guard"
+CONFIG_CMDLINE="console=ttynull stack_depot_disable=on init_on_alloc=0 cgroup_disable=pressure kasan=off kfence.sample_interval=0 rcu_nocbs=all rcutree.enable_rcu_lazy=1 bootconfig ioremap_guard"
 CONFIG_CMDLINE_EXTEND=y
 #CONFIG_READ_ONLY_THP_FOR_FS=y
 # CONFIG_CMDLINE="console=ttynull stack_depot_disable=on cgroup_disable=pressure kasan.stacktrace=off kvm-arm.mode=protected bootconfig ioremap_guard rcu_nocbs=all rcutree.enable_rcu_lazy=1"
 
+# EDIT15
+CONFIG_NET_SCH_DEFAULT=y
+CONFIG_DEFAULT_FQ=y
 
+# EDIT16
+# CONFIG_LTO_NONE is not set
+# CONFIG_LTO_CLANG_FULL is not set
+CONFIG_LTO_CLANG_THIN=y
 
 CONFIG_UAPI_HEADER_TEST=y
 CONFIG_AUDIT=y
