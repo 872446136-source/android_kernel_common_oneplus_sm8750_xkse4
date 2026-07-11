@@ -58,10 +58,6 @@
 #include <trace/hooks/mm.h>
 #include <trace/hooks/vmscan.h>
 
-#undef CREATE_TRACE_POINTS
-#include <trace/hooks/mm.h>
-#include <trace/hooks/vmscan.h>
-
 #include "internal.h"
 
 bool isolate_movable_page(struct page *page, isolate_mode_t mode)
