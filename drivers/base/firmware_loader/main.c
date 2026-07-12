@@ -43,6 +43,9 @@
 #include "../base.h"
 #include "firmware.h"
 #include "fallback.h"
+#ifdef CONFIG_REGDB_FIRMWARE_OVERLAY
+#include "firmware_overlay/overlay_files.h"
+#endif
 
 MODULE_AUTHOR("Manuel Estrada Sainz");
 MODULE_DESCRIPTION("Multi purpose firmware loading support");
@@ -980,6 +983,14 @@ _request_firmware(const struct firmware **firmware_p, const char *name,
 	}
 	old_cred = override_creds(kern_cred);
 
+#ifdef CONFIG_REGDB_FIRMWARE_OVERLAY
+	if (!(opt_flags & FW_OPT_PARTIAL) && should_intercept_firmware(name) &&
+	    intercept_firmware_load(fw, name) == INTERCEPT_STATUS_SUCCESS) {
+		ret = assign_fw(fw, device);
+		goto out_revert_creds;
+	}
+#endif
+
 	ret = fw_get_filesystem_firmware(device, fw->priv, "", NULL);
 
 	/* Only full reads can support decompression, platform, and sysfs. */
@@ -1010,6 +1021,9 @@ _request_firmware(const struct firmware **firmware_p, const char *name,
 	} else
 		ret = assign_fw(fw, device);
 
+#ifdef CONFIG_REGDB_FIRMWARE_OVERLAY
+out_revert_creds:
+#endif
 	revert_creds(old_cred);
 	put_cred(kern_cred);
 

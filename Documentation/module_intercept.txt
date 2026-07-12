@@ -1,0 +1,15 @@
+Embedded Wi-Fi regdb overlay
+============================
+
+This tree can embed a replacement regdb.bin. The overlay is opt-in and is
+disabled when its command-line property is missing or has any value other
+than "1".
+
+Enable the firmware overlay independently with:
+
+  regdb_overlay.enable=1
+
+The embedded regdb.bin is an imported binary artifact. Its regulatory rules
+and provenance cannot be established from source in this tree. Keep the
+overlay disabled until its device-specific Wi-Fi behavior and compliance with
+the applicable local regulations have been verified.

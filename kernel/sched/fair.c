@@ -6733,20 +6733,6 @@ static inline void set_rd_overutilized_status(struct root_domain *rd,
 	trace_sched_overutilized_tp(rd, !!status);
 }
 
-static inline void check_update_overutilized_status(struct rq *rq)
-{
-	/*
-	 * overutilized field is used for load balancing decisions only
-	 * if energy aware scheduler is being used
-	 */
-	if (!sched_energy_enabled())
-		return;
-
-	if (!READ_ONCE(rq->rd->overutilized) && cpu_overutilized(rq->cpu))
-		set_rd_overutilized_status(rq->rd, SG_OVERUTILIZED);
-}
-#else
-static inline void check_update_overutilized_status(struct rq *rq) { }
 #endif
 
 /* Runqueue only has SCHED_IDLE tasks enqueued */
@@ -6774,7 +6760,6 @@ enqueue_task_fair(struct rq *rq, struct task_struct *p, int flags)
 	struct cfs_rq *cfs_rq;
 	struct sched_entity *se = &p->se;
 	int idle_h_nr_running = task_has_idle_policy(p);
-	int task_new = !(flags & ENQUEUE_WAKEUP);
 	int should_iowait_boost;
 
 	/*
@@ -6850,9 +6835,6 @@ enqueue_task_fair(struct rq *rq, struct task_struct *p, int flags)
 	 * into account, but that is not straightforward to implement,
 	 * and the following generally works well enough in practice.
 	 */
-	if (!task_new)
-		check_update_overutilized_status(rq);
-
 enqueue_throttle:
 	assert_list_leaf_cfs_rq(rq);
 
@@ -7847,12 +7829,18 @@ static unsigned long cpu_util_without(int cpu, struct task_struct *p)
  *                  contribution. Given by eenv_pd_busy_time().
  * @cpu_cap:        Maximum CPU capacity for the perf domain.
  * @pd_cap:         Entire perf domain capacity. (pd->nr_cpus * cpu_cap).
+ * @pd_max_util:    Maximum frequency utilization without the task.
+ * @pd_second_max_util: Second-highest utilization without the task.
+ * @pd_max_util_cpu: CPU that contributed @pd_max_util.
  */
 struct energy_env {
 	unsigned long task_busy_time;
 	unsigned long pd_busy_time;
 	unsigned long cpu_cap;
 	unsigned long pd_cap;
+	unsigned long pd_max_util;
+	unsigned long pd_second_max_util;
+	int pd_max_util_cpu;
 };
 
 /*
@@ -7923,12 +7911,16 @@ static inline unsigned long
 eenv_pd_max_util(struct energy_env *eenv, struct cpumask *pd_cpus,
 		 struct task_struct *p, int dst_cpu)
 {
-	unsigned long max_util = 0;
-	int cpu;
+	unsigned long max_util;
 
-	for_each_cpu(cpu, pd_cpus) {
-		struct task_struct *tsk = (cpu == dst_cpu) ? p : NULL;
-		unsigned long util = cpu_util(cpu, p, dst_cpu, 1);
+	/* Placement replaces the cached baseline value for @dst_cpu. */
+	if (dst_cpu == eenv->pd_max_util_cpu)
+		max_util = eenv->pd_second_max_util;
+	else
+		max_util = eenv->pd_max_util;
+
+	if (dst_cpu >= 0 && cpumask_test_cpu(dst_cpu, pd_cpus)) {
+		unsigned long util = cpu_util(dst_cpu, p, dst_cpu, 1);
 		unsigned long eff_util;
 
 		/*
@@ -7938,7 +7930,7 @@ eenv_pd_max_util(struct energy_env *eenv, struct cpumask *pd_cpus,
 		 * NOTE: in case RT tasks are running, by default the
 		 * FREQUENCY_UTIL's utilization can be max OPP.
 		 */
-		eff_util = effective_cpu_util(cpu, util, FREQUENCY_UTIL, tsk);
+		eff_util = effective_cpu_util(dst_cpu, util, FREQUENCY_UTIL, p);
 		max_util = max(max_util, eff_util);
 	}
 
@@ -8076,11 +8068,30 @@ static int find_energy_efficient_cpu(struct task_struct *p, int prev_cpu, int sy
 
 		eenv.cpu_cap = cpu_thermal_cap;
 		eenv.pd_cap = 0;
+		eenv.pd_max_util = 0;
+		eenv.pd_second_max_util = 0;
+		eenv.pd_max_util_cpu = -1;
 
 		for_each_cpu(cpu, cpus) {
 			struct rq *rq = cpu_rq(cpu);
+			unsigned long base_util, base_eff_util;
 
 			eenv.pd_cap += cpu_thermal_cap;
+
+			/*
+			 * Cache the frequency requirement after removing @p. Only
+			 * the destination CPU changes for each placement candidate.
+			 */
+			base_util = cpu_util(cpu, p, -1, 1);
+			base_eff_util = effective_cpu_util(cpu, base_util,
+						   FREQUENCY_UTIL, NULL);
+			if (base_eff_util > eenv.pd_max_util) {
+				eenv.pd_second_max_util = eenv.pd_max_util;
+				eenv.pd_max_util = base_eff_util;
+				eenv.pd_max_util_cpu = cpu;
+			} else if (base_eff_util > eenv.pd_second_max_util) {
+				eenv.pd_second_max_util = base_eff_util;
+			}
 
 			if (!cpumask_test_cpu(cpu, sched_domain_span(sd)))
 				continue;
@@ -9578,6 +9589,7 @@ struct sg_lb_stats {
 	unsigned int nr_numa_running;
 	unsigned int nr_preferred_running;
 #endif
+	unsigned int nr_overutilized;
 };
 
 /*
@@ -10032,8 +10044,10 @@ static inline void update_sg_lb_stats(struct lb_env *env,
 		if (nr_running > 1)
 			*sg_status |= SG_OVERLOAD;
 
-		if (cpu_overutilized(i))
+		if (cpu_overutilized(i)) {
 			*sg_status |= SG_OVERUTILIZED;
+			sgs->nr_overutilized++;
+		}
 
 #ifdef CONFIG_NUMA_BALANCING
 		sgs->nr_numa_running += rq->nr_numa_running;
@@ -10702,6 +10716,7 @@ static inline void update_sd_lb_stats(struct lb_env *env, struct sd_lb_stats *sd
 	struct sg_lb_stats *local = &sds->local_stat;
 	struct sg_lb_stats tmp_sgs;
 	unsigned long sum_util = 0;
+	unsigned int domain_overutilized = 0;
 	int sg_status = 0;
 
 	do {
@@ -10719,6 +10734,7 @@ static inline void update_sd_lb_stats(struct lb_env *env, struct sd_lb_stats *sd
 		}
 
 		update_sg_lb_stats(env, sds, sg, sgs, &sg_status);
+		domain_overutilized += sgs->nr_overutilized;
 
 		if (local_group)
 			goto next_group;
@@ -10751,12 +10767,15 @@ next_group:
 		env->fbq_type = fbq_classify_group(&sds->busiest_stat);
 
 	if (!env->sd->parent) {
+		unsigned int threshold = env->sd->span_weight >> 1;
+
 		/* update overload indicator if we are at root domain */
 		WRITE_ONCE(env->dst_rq->rd->overload, sg_status & SG_OVERLOAD);
 
-		/* Update over-utilization (tipping point, U >= 0) indicator */
+		/* Keep EAS active until more than half the domain is saturated. */
 		set_rd_overutilized_status(env->dst_rq->rd,
-					   sg_status & SG_OVERUTILIZED);
+				domain_overutilized > threshold ?
+				SG_OVERUTILIZED : 0);
 	} else if (sg_status & SG_OVERUTILIZED) {
 		set_rd_overutilized_status(env->dst_rq->rd, SG_OVERUTILIZED);
 	}
@@ -12777,8 +12796,6 @@ static void task_tick_fair(struct rq *rq, struct task_struct *curr, int queued)
 		task_tick_numa(rq, curr);
 
 	update_misfit_status(curr, rq);
-	check_update_overutilized_status(task_rq(curr));
-
 	task_tick_core(rq, curr);
 }
 

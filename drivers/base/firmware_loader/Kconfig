@@ -39,6 +39,14 @@ config FW_LOADER_DEBUG
 
 if FW_LOADER
 
+config REGDB_FIRMWARE_OVERLAY
+	bool "Embed an optional Wi-Fi regdb replacement"
+	select ZSTD_DECOMPRESS
+	help
+	  Embed regdb.bin and return it for firmware requests with the same
+	  basename when regdb_overlay.enable=1 is present on the kernel command
+	  line. The replacement remains disabled by default.
+
 config FW_LOADER_PAGED_BUF
 	bool
 
