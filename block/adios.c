@@ -155,12 +155,17 @@ enum adios_state_flags {
 	ADIOS_STATE_DL_1      = 1U << 3,
 	ADIOS_STATE_BQ_PAGE_0 = 1U << 4,
 	ADIOS_STATE_BQ_PAGE_1 = 1U << 5,
-	ADIOS_STATE_BARRIER   = 1U << 6,
+	ADIOS_STATE_BARRIER        = 1U << 6,
+	ADIOS_STATE_FALLBACK_MODE  = 1U << 7,
+	ADIOS_STATE_FALLBACK_QUEUE = 1U << 8,
 };
 #define ADIOS_STATE_PQ 0
 #define ADIOS_STATE_DL 2
 #define ADIOS_STATE_BQ 4
 #define ADIOS_STATE_BP 6
+
+#define ADIOS_FALLBACK_QUEUED		((void *)1UL)
+#define ADIOS_FALLBACK_INFLIGHT		((void *)2UL)
 
 // Temporal granularity of the deadline tree node (dl_group)
 #define ADIOS_QUANTUM_SHIFT 20
@@ -264,6 +269,9 @@ struct adios_data {
 	spinlock_t bq_lock;
 	spinlock_t barrier_lock;
 	struct list_head barrier_queue;
+	spinlock_t fallback_lock;
+	struct list_head fallback_queue;
+	atomic_t fallback_inflight;
 
 	struct lm_buckets *aggr_buckets;
 
@@ -900,6 +908,28 @@ static bool merge_or_insert_to_dl_tree(struct adios_data *ad,
 	return false;
 }
 
+
+/*
+ * Allocation failures must never make a request disappear.  Once this path is
+ * entered, keep this scheduler instance in a conservative, single-flight FIFO
+ * mode until it is replaced or the device is rebooted.  Keeping FALLBACK_MODE
+ * set avoids later requests overtaking a failed allocation or a flush request.
+ */
+static void insert_to_fallback_queue(struct adios_data *ad, struct request *rq)
+{
+	struct adios_rq_data *rd = rq->elv.priv[0];
+
+	if (rd)
+		rd->managed = false;
+	rq->elv.priv[1] = ADIOS_FALLBACK_QUEUED;
+
+	scoped_guard(spinlock_irqsave, &ad->fallback_lock) {
+		list_add_tail(&rq->queuelist, &ad->fallback_queue);
+		atomic_or(ADIOS_STATE_FALLBACK_MODE |
+			  ADIOS_STATE_FALLBACK_QUEUE, &ad->state);
+	}
+}
+
 static void insert_to_prio_queue(struct adios_data *ad,
 		struct request *rq, bool pq_idx) {
 	struct adios_rq_data *rd = get_rq_data(rq);
@@ -1009,6 +1039,11 @@ static void adios_insert_requests(struct blk_mq_hw_ctx *hctx,
 		}
 		rq = list_first_entry(list, struct request, queuelist);
 		list_del_init(&rq->queuelist);
+		if (unlikely(!rq->elv.priv[0] ||
+		    (get_adios_state(ad) & ADIOS_STATE_FALLBACK_MODE))) {
+			insert_to_fallback_queue(ad, rq);
+			continue;
+		}
 		if (likely(ad->models_stable))
 			insert_request_post_stability(hctx, rq, insert_flags, &free);
 		else
@@ -1024,9 +1059,16 @@ static void adios_prepare_request(struct request *rq) {
 	struct adios_rq_data *rd;
 
 	rd = mempool_alloc(ad->rq_data_pool, GFP_ATOMIC);
+	if (unlikely(!rd)) {
+		rq->elv.priv[0] = NULL;
+		rq->elv.priv[1] = NULL;
+		pr_err_ratelimited("adios: rq_data allocation failed; entering FIFO fallback\n");
+		return;
+	}
 	memset(rd, 0, sizeof(*rd));
 	rd->rq = rq;
 	rq->elv.priv[0] = rd;
+	rq->elv.priv[1] = NULL;
 }
 
 static struct adios_rq_data *get_dl_first_rd(struct adios_data *ad, bool idx) {
@@ -1306,6 +1348,29 @@ static struct request *dispatch_from_pq(struct adios_data *ad) {
 	return rq;
 }
 
+
+static struct request *dispatch_from_fallback(struct adios_data *ad)
+{
+	struct request *rq;
+
+	guard(spinlock_irqsave)(&ad->fallback_lock);
+
+	/* Preserve submission ordering, including flush ordering, under OOM. */
+	if (atomic_read(&ad->fallback_inflight) ||
+	    list_empty(&ad->fallback_queue))
+		return NULL;
+
+	rq = list_first_entry(&ad->fallback_queue, struct request, queuelist);
+	list_del_init(&rq->queuelist);
+	rq->elv.priv[1] = ADIOS_FALLBACK_INFLIGHT;
+	atomic_set(&ad->fallback_inflight, 1);
+
+	if (list_empty(&ad->fallback_queue))
+		atomic_andnot(ADIOS_STATE_FALLBACK_QUEUE, &ad->state);
+
+	return rq;
+}
+
 static bool release_barrier_requests(struct adios_data *ad) {
 	u32 moved_count = 0;
 	LIST_HEAD(local_list);
@@ -1384,6 +1449,10 @@ retry:
 			goto retry;
 	}
 
+	rq = dispatch_from_fallback(ad);
+	if (rq)
+		goto found;
+
 	return NULL;
 found:
 	if (ad->is_rotational)
@@ -1406,6 +1475,14 @@ static void adios_completed_request(struct request *rq, u64 now) {
 	struct adios_data *ad = rq->q->elevator->elevator_data;
 	struct adios_rq_data *rd = get_rq_data(rq);
 	union adios_in_flight_rqs ifr = { .scalar = 0 };
+
+	if (unlikely(rq->elv.priv[1] == ADIOS_FALLBACK_INFLIGHT)) {
+		atomic_set(&ad->fallback_inflight, 0);
+		rq->elv.priv[1] = NULL;
+		return;
+	}
+	if (unlikely(!rd))
+		return;
 
 	if (rd->managed) {
 		union adios_in_flight_rqs ifr_to_sub = {
@@ -1466,6 +1543,17 @@ static void adios_completed_request(struct request *rq, u64 now) {
 	timer_reduce(&ad->update_timer, jiffies + msecs_to_jiffies(100));
 }
 
+
+static void adios_requeue_request(struct request *rq)
+{
+	struct adios_data *ad = rq->q->elevator->elevator_data;
+
+	if (rq->elv.priv[1] == ADIOS_FALLBACK_INFLIGHT) {
+		atomic_set(&ad->fallback_inflight, 0);
+		rq->elv.priv[1] = ADIOS_FALLBACK_QUEUED;
+	}
+}
+
 // Clean up after a request is finished
 static void adios_finish_request(struct request *rq) {
 	struct adios_data *ad = rq->q->elevator->elevator_data;
@@ -1475,13 +1563,18 @@ static void adios_finish_request(struct request *rq) {
 		mempool_free(get_rq_data(rq), ad->rq_data_pool);
 		rq->elv.priv[0] = NULL;
 	}
+	rq->elv.priv[1] = NULL;
 }
 
 // Check if there are any requests available for dispatch
 static bool adios_has_work(struct blk_mq_hw_ctx *hctx) {
 	struct adios_data *ad = hctx->queue->elevator->elevator_data;
 
-	return atomic_read(&ad->state) != 0;
+	u32 state = atomic_read(&ad->state);
+
+	if (atomic_read(&ad->fallback_inflight))
+		state &= ~ADIOS_STATE_FALLBACK_QUEUE;
+	return (state & ~ADIOS_STATE_FALLBACK_MODE) != 0;
 }
 
 // Initialize the scheduler-specific data for a hardware queue
@@ -1611,12 +1704,15 @@ static int adios_init_sched(struct request_queue *q, struct elevator_type *e) {
 	ad->models_stable = false;
 
 	atomic_set(&ad->state, 0);
+	atomic_set(&ad->fallback_inflight, 0);
 
 	spin_lock_init(&ad->lock);
 	spin_lock_init(&ad->pq_lock);
 	spin_lock_init(&ad->bq_lock);
 	spin_lock_init(&ad->barrier_lock);
+	spin_lock_init(&ad->fallback_lock);
 	INIT_LIST_HEAD(&ad->barrier_queue);
+	INIT_LIST_HEAD(&ad->fallback_queue);
 
 	timer_setup(&ad->update_timer, update_timer_callback, 0);
 
@@ -1660,6 +1756,8 @@ static void adios_exit_sched(struct elevator_queue *e) {
 	timer_shutdown_sync(&ad->update_timer);
 
 	WARN_ON_ONCE(!list_empty(&ad->barrier_queue));
+	WARN_ON_ONCE(!list_empty(&ad->fallback_queue));
+	WARN_ON_ONCE(atomic_read(&ad->fallback_inflight));
 	for (int i = 0; i < 2; i++)
 		WARN_ON_ONCE(!list_empty(&ad->prio_queue[i]));
 
@@ -2041,6 +2139,7 @@ static struct elevator_type mq_adios = {
 		.prepare_request	= adios_prepare_request,
 		.dispatch_request	= adios_dispatch_request,
 		.completed_request	= adios_completed_request,
+		.requeue_request	= adios_requeue_request,
 		.finish_request		= adios_finish_request,
 		.has_work			= adios_has_work,
 		.init_hctx			= adios_init_hctx,
