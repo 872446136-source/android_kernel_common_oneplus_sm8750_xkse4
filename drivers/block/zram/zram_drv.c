@@ -33,6 +33,7 @@
 #include <linux/debugfs.h>
 #include <linux/cpuhotplug.h>
 #include <linux/part_stat.h>
+#include <linux/sysctl.h>
 
 #include "zram_drv.h"
 
@@ -56,6 +57,28 @@ static const struct block_device_operations zram_devops;
 static void zram_free_page(struct zram *zram, size_t index);
 static int zram_read_page(struct zram *zram, struct page *page, u32 index,
 			  struct bio *parent);
+
+#ifdef CONFIG_ZRAM_MULTI_COMP
+/*
+ * Number of secondary compressors tried during the initial ZRAM write.
+ * 0: primary only; 1: priorities 0..1; ...; 3: priorities 0..3.
+ */
+static u8 sysctl_zram_recomp_immediate __read_mostly = 1;
+
+static struct ctl_table zram_sysctl_table[] = {
+	{
+		.procname	= "zram_recomp_immediate",
+		.data		= &sysctl_zram_recomp_immediate,
+		.maxlen		= sizeof(sysctl_zram_recomp_immediate),
+		.mode		= 0644,
+		.proc_handler	= proc_dou8vec_minmax,
+		.extra1		= SYSCTL_ZERO,
+		.extra2		= SYSCTL_THREE,
+	},
+};
+
+static struct ctl_table_header *zram_sysctl_header;
+#endif
 
 static int zram_slot_trylock(struct zram *zram, u32 index)
 {
@@ -1438,10 +1461,15 @@ static int zram_write_page(struct zram *zram, struct page *page, u32 index)
 	unsigned long alloced_pages;
 	unsigned long handle = -ENOMEM;
 	unsigned int comp_len = 0;
+	unsigned int alloc_len = 0;
 	void *src, *dst, *mem;
-	struct zcomp_strm *zstrm;
+	struct zcomp_strm *zstrm = NULL;
 	unsigned long element = 0;
 	enum zram_pageflags flags = 0;
+	u8 prio;
+	u8 selected_prio = ZRAM_PRIMARY_COMP;
+	u8 prio_max = 1;
+	bool incompressible = false;
 
 	mem = kmap_atomic(page);
 	if (page_same_filled(mem, &element)) {
@@ -1453,33 +1481,66 @@ static int zram_write_page(struct zram *zram, struct page *page, u32 index)
 	}
 	kunmap_atomic(mem);
 
-compress_again:
-	zstrm = zcomp_stream_get(zram->comps[ZRAM_PRIMARY_COMP]);
-	src = kmap_atomic(page);
-	ret = zcomp_compress(zstrm, src, &comp_len);
-	kunmap_atomic(src);
+#ifdef CONFIG_ZRAM_MULTI_COMP
+	prio_max = min_t(u8, (u8)zram->num_active_comps,
+			 sysctl_zram_recomp_immediate + 1);
+#endif
+	/* A fully initialized ZRAM device always has the primary compressor. */
+	if (unlikely(!prio_max))
+		prio_max = 1;
 
-	if (unlikely(ret)) {
-		zcomp_stream_put(zram->comps[ZRAM_PRIMARY_COMP]);
-		pr_err("Compression failed! err=%d\n", ret);
-		zs_free(zram->mem_pool, handle);
-		return ret;
+	/*
+	 * Try compressors in priority order. Keep the first stream that reduces
+	 * the page below huge_class_size. Higher priorities are only attempted
+	 * when the previous compressor would have stored an uncompressed page.
+	 */
+	for (prio = ZRAM_PRIMARY_COMP; prio < prio_max; prio++) {
+		if (!zram->comps[prio])
+			continue;
+
+		zstrm = zcomp_stream_get(zram->comps[prio]);
+		src = kmap_atomic(page);
+		ret = zcomp_compress(zstrm, src, &comp_len);
+		kunmap_atomic(src);
+
+		if (unlikely(ret)) {
+			zcomp_stream_put(zram->comps[prio]);
+			pr_err("Compression failed! err=%d, priority=%u\n",
+			       ret, prio);
+			return ret;
+		}
+
+		if (comp_len < huge_class_size) {
+			selected_prio = prio;
+			break;
+		}
+
+		zcomp_stream_put(zram->comps[prio]);
+		zstrm = NULL;
 	}
 
-	if (comp_len >= huge_class_size)
+	if (!zstrm) {
+		/*
+		 * None of the permitted compressors helped. Store the original page,
+		 * while retaining a primary stream as required by the original slow
+		 * allocation / CPU-hotplug exclusion contract.
+		 */
+		selected_prio = ZRAM_PRIMARY_COMP;
+		zstrm = zcomp_stream_get(zram->comps[selected_prio]);
 		comp_len = PAGE_SIZE;
+#ifdef CONFIG_ZRAM_MULTI_COMP
+		incompressible = prio_max >= (u8)zram->num_active_comps;
+#endif
+	}
+
+	alloc_len = comp_len;
+
 	/*
-	 * handle allocation has 2 paths:
-	 * a) fast path is executed with preemption disabled (for
-	 *  per-cpu streams) and has __GFP_DIRECT_RECLAIM bit clear,
-	 *  since we can't sleep;
-	 * b) slow path enables preemption and attempts to allocate
-	 *  the page with __GFP_DIRECT_RECLAIM bit set. we have to
-	 *  put per-cpu compression stream and, thus, to re-do
-	 *  the compression once handle is allocated.
-	 *
-	 * if we have a 'non-null' handle here then we are coming
-	 * from the slow path and handle has already been allocated.
+	 * Handle allocation has two paths:
+	 * a) fast path runs with preemption disabled for the per-CPU stream and
+	 *    therefore cannot perform direct reclaim;
+	 * b) slow path drops the stream, allocates with reclaim enabled, then
+	 *    recompresses with the SAME selected compressor.
 	 */
 	if (IS_ERR_VALUE(handle))
 		handle = zs_malloc(zram->mem_pool, comp_len,
@@ -1489,31 +1550,45 @@ compress_again:
 				__GFP_MOVABLE |
 				__GFP_CMA);
 	if (IS_ERR_VALUE(handle)) {
-		zcomp_stream_put(zram->comps[ZRAM_PRIMARY_COMP]);
+		zcomp_stream_put(zram->comps[selected_prio]);
+		zstrm = NULL;
 		atomic64_inc(&zram->stats.writestall);
+
 		handle = zs_malloc(zram->mem_pool, comp_len,
 				GFP_NOIO | __GFP_HIGHMEM |
 				__GFP_MOVABLE | __GFP_CMA);
 		if (IS_ERR_VALUE(handle))
 			return PTR_ERR((void *)handle);
 
-		if (comp_len != PAGE_SIZE)
-			goto compress_again;
-		/*
-		 * If the page is not compressible, you need to acquire the
-		 * lock and execute the code below. The zcomp_stream_get()
-		 * call is needed to disable the cpu hotplug and grab the
-		 * zstrm buffer back. It is necessary that the dereferencing
-		 * of the zstrm variable below occurs correctly.
-		 */
-		zstrm = zcomp_stream_get(zram->comps[ZRAM_PRIMARY_COMP]);
+		zstrm = zcomp_stream_get(zram->comps[selected_prio]);
+		if (comp_len != PAGE_SIZE) {
+			src = kmap_atomic(page);
+			ret = zcomp_compress(zstrm, src, &comp_len);
+			kunmap_atomic(src);
+			if (unlikely(ret)) {
+				zcomp_stream_put(zram->comps[selected_prio]);
+				zs_free(zram->mem_pool, handle);
+				pr_err("Recompression failed! err=%d, priority=%u\n",
+				       ret, selected_prio);
+				return ret;
+			}
+
+			/* Never copy more data than the slow-path allocation requested. */
+			if (unlikely(comp_len > alloc_len)) {
+				zcomp_stream_put(zram->comps[selected_prio]);
+				zs_free(zram->mem_pool, handle);
+				pr_err("Recompression size changed: %u > %u, priority=%u\n",
+				       comp_len, alloc_len, selected_prio);
+				return -EIO;
+			}
+		}
 	}
 
 	alloced_pages = zs_get_total_pages(zram->mem_pool);
 	update_used_max(zram, alloced_pages);
 
 	if (zram->limit_pages && alloced_pages > zram->limit_pages) {
-		zcomp_stream_put(zram->comps[ZRAM_PRIMARY_COMP]);
+		zcomp_stream_put(zram->comps[selected_prio]);
 		zs_free(zram->mem_pool, handle);
 		return -ENOMEM;
 	}
@@ -1527,13 +1602,13 @@ compress_again:
 	if (comp_len == PAGE_SIZE)
 		kunmap_atomic(src);
 
-	zcomp_stream_put(zram->comps[ZRAM_PRIMARY_COMP]);
+	zcomp_stream_put(zram->comps[selected_prio]);
 	zs_unmap_object(zram->mem_pool, handle);
 	atomic64_add(comp_len, &zram->stats.compr_data_size);
 out:
 	/*
-	 * Free memory associated with this sector
-	 * before overwriting unused sectors.
+	 * Keep the old slot intact until compression, allocation and copying of
+	 * the replacement object have all succeeded.
 	 */
 	zram_slot_lock(zram, index);
 	zram_free_page(zram, index);
@@ -1547,9 +1622,12 @@ out:
 	if (flags) {
 		zram_set_flag(zram, index, flags);
 		zram_set_element(zram, index, element);
-	}  else {
+	} else {
 		zram_set_handle(zram, index, handle);
 		zram_set_obj_size(zram, index, comp_len);
+		zram_set_priority(zram, index, selected_prio);
+		if (incompressible)
+			zram_set_flag(zram, index, ZRAM_INCOMPRESSIBLE);
 	}
 	zram_slot_unlock(zram, index);
 
@@ -2466,6 +2544,15 @@ static int __init zram_init(void)
 		num_devices--;
 	}
 
+
+#ifdef CONFIG_ZRAM_MULTI_COMP
+	zram_sysctl_header = register_sysctl("vm", zram_sysctl_table);
+	if (!zram_sysctl_header)
+		pr_warn("failed to register ZRAM-IR sysctl\n");
+	else
+		pr_info("ZRAM Immediate Recompression enabled\n");
+#endif
+
 	return 0;
 
 out_error:
@@ -2475,6 +2562,10 @@ out_error:
 
 static void __exit zram_exit(void)
 {
+#ifdef CONFIG_ZRAM_MULTI_COMP
+	if (zram_sysctl_header)
+		unregister_sysctl_table(zram_sysctl_header);
+#endif
 	destroy_devices();
 }
 
