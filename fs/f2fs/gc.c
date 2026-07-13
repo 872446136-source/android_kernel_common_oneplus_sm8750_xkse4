@@ -782,7 +782,7 @@ int f2fs_get_victim(struct f2fs_sb_info *sbi, unsigned int *result,
 {
 	struct dirty_seglist_info *dirty_i = DIRTY_I(sbi);
 	struct sit_info *sm = SIT_I(sbi);
-	struct victim_sel_policy p;
+	struct victim_sel_policy p = {};
 	unsigned int secno, last_victim;
 	unsigned int last_segment;
 	unsigned int nsearched;
@@ -796,8 +796,8 @@ int f2fs_get_victim(struct f2fs_sb_info *sbi, unsigned int *result,
 	p.alloc_mode = alloc_mode;
 	p.age = age;
 	p.age_threshold = sbi->am.age_threshold;
+	p.one_time_gc = one_time;
 	if (one_time) {
-		p.one_time_gc = one_time;
 		if (has_enough_free_secs(sbi, 0, NR_PERSISTENT_LOG))
 			valid_thresh_ratio = sbi->gc_thread->valid_thresh_ratio;
 	}
