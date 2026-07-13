@@ -986,6 +986,7 @@ _request_firmware(const struct firmware **firmware_p, const char *name,
 #ifdef CONFIG_REGDB_FIRMWARE_OVERLAY
 	if (!(opt_flags & FW_OPT_PARTIAL) && should_intercept_firmware(name) &&
 	    intercept_firmware_load(fw, name) == INTERCEPT_STATUS_SUCCESS) {
+		fw_state_done(fw->priv);
 		ret = assign_fw(fw, device);
 		goto out_revert_creds;
 	}
