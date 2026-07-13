@@ -721,7 +721,7 @@ static inline u32 eval_adios_state(struct adios_data *ad, u32 shift)
 { return eval_this_adios_state(get_adios_state(ad), shift); }
 
 // Add a request to the deadline-sorted red-black tree
-static void add_to_dl_tree(
+static bool add_to_dl_tree(
 		struct adios_data *ad, bool dl_idx, struct request *rq) {
 	struct rb_root_cached *root = &ad->dl_tree[dl_idx];
 	struct rb_node **link = &(root->rb_root.rb_node), *parent = NULL;
@@ -767,7 +767,7 @@ static void add_to_dl_tree(
 	if (!dlg || dlg->deadline != deadline) {
 		dlg = kmem_cache_zalloc(ad->dl_group_pool, GFP_ATOMIC);
 		if (!dlg)
-			return;
+			return false;
 		dlg->deadline = deadline;
 		INIT_LIST_HEAD(&dlg->rqs);
 		rb_link_node(&dlg->node, parent, link);
@@ -779,6 +779,7 @@ found:
 
 	if (was_empty)
 		set_adios_state(ad, ADIOS_STATE_DL, dl_idx, true);
+	return true;
 }
 
 // Remove a request from the deadline-sorted red-black tree
@@ -854,7 +855,13 @@ static void adios_request_merged(struct request_queue *q, struct request *req,
 
 	// Reposition request in the deadline-sorted tree
 	del_from_dl_tree(ad, dl_idx, req);
-	add_to_dl_tree(ad, dl_idx, req);
+	if (!add_to_dl_tree(ad, dl_idx, req)) {
+		if (!hlist_unhashed(&req->hash))
+			elv_rqhash_del(q, req);
+		if (q->last_merge == req)
+			q->last_merge = NULL;
+		insert_to_fallback_queue(ad, req);
+	}
 }
 
 // Handle merging of requests after one has been merged into another
@@ -897,7 +904,11 @@ static bool merge_or_insert_to_dl_tree(struct adios_data *ad,
 		return true;
 
 	bool dl_idx = adios_optype_not_read(rq);
-	add_to_dl_tree(ad, dl_idx, rq);
+	if (!add_to_dl_tree(ad, dl_idx, rq)) {
+		pr_err_ratelimited("adios: dl_group allocation failed; entering FIFO fallback\n");
+		insert_to_fallback_queue(ad, rq);
+		return true;
+	}
 
 	if (rq_mergeable(rq)) {
 		elv_rqhash_add(q, rq);
