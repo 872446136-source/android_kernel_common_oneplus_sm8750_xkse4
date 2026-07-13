@@ -1472,6 +1472,7 @@ static int zram_write_page(struct zram *zram, struct page *page, u32 index)
 	bool incompressible = false;
 #ifdef CONFIG_ZRAM_MULTI_COMP
 	u8 tried_comps = 0;
+	bool secondary_error = false;
 #endif
 
 	mem = kmap_atomic(page);
@@ -1486,7 +1487,7 @@ static int zram_write_page(struct zram *zram, struct page *page, u32 index)
 
 #ifdef CONFIG_ZRAM_MULTI_COMP
 	prio_max = min_t(u8, ZRAM_MAX_COMPS,
-			 sysctl_zram_recomp_immediate + 1);
+			 READ_ONCE(sysctl_zram_recomp_immediate) + 1);
 #endif
 	/* A fully initialized ZRAM device always has the primary compressor. */
 	if (unlikely(!prio_max))
@@ -1512,9 +1513,19 @@ static int zram_write_page(struct zram *zram, struct page *page, u32 index)
 
 		if (unlikely(ret)) {
 			zcomp_stream_put(zram->comps[prio]);
-			pr_err("Compression failed! err=%d, priority=%u\n",
-			       ret, prio);
-			return ret;
+			zstrm = NULL;
+			if (prio == ZRAM_PRIMARY_COMP) {
+				pr_err("Compression failed! err=%d, priority=%u\n",
+				       ret, prio);
+				return ret;
+			}
+#ifdef CONFIG_ZRAM_MULTI_COMP
+			secondary_error = true;
+#endif
+			pr_err_ratelimited(
+				"Secondary compression failed! err=%d, priority=%u\n",
+				ret, prio);
+			continue;
 		}
 
 		if (comp_len < huge_class_size) {
@@ -1536,7 +1547,7 @@ static int zram_write_page(struct zram *zram, struct page *page, u32 index)
 		zstrm = zcomp_stream_get(zram->comps[selected_prio]);
 		comp_len = PAGE_SIZE;
 #ifdef CONFIG_ZRAM_MULTI_COMP
-		incompressible =
+		incompressible = !secondary_error &&
 			tried_comps == (u8)zram->num_active_comps;
 #endif
 	}
