@@ -156,8 +156,8 @@ enum adios_state_flags {
 	ADIOS_STATE_BQ_PAGE_0 = 1U << 4,
 	ADIOS_STATE_BQ_PAGE_1 = 1U << 5,
 	ADIOS_STATE_BARRIER        = 1U << 6,
-	ADIOS_STATE_FALLBACK_MODE  = 1U << 7,
-	ADIOS_STATE_FALLBACK_QUEUE = 1U << 8,
+	ADIOS_STATE_FALLBACK_MODE  = 1U << 8,
+	ADIOS_STATE_FALLBACK_QUEUE = 1U << 9,
 };
 #define ADIOS_STATE_PQ 0
 #define ADIOS_STATE_DL 2
@@ -703,6 +703,9 @@ static inline struct adios_rq_data *get_rq_data(struct request *rq) {
 	return rq->elv.priv[0];
 }
 
+static void insert_to_fallback_queue(struct adios_data *ad,
+				     struct request *rq);
+
 static inline
 void set_adios_state(struct adios_data *ad, u32 shift, u32 idx, bool flag) {
 	if (flag)
@@ -883,6 +886,8 @@ static bool adios_bio_merge(struct request_queue *q, struct bio *bio,
 	struct request *free = NULL;
 	bool ret;
 
+	if (get_adios_state(ad) & ADIOS_STATE_FALLBACK_MODE)
+		return false;
 	if (eval_adios_state(ad, ADIOS_STATE_BP))
 		return false;
 
