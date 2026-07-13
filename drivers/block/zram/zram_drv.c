@@ -1470,6 +1470,9 @@ static int zram_write_page(struct zram *zram, struct page *page, u32 index)
 	u8 selected_prio = ZRAM_PRIMARY_COMP;
 	u8 prio_max = 1;
 	bool incompressible = false;
+#ifdef CONFIG_ZRAM_MULTI_COMP
+	u8 tried_comps = 0;
+#endif
 
 	mem = kmap_atomic(page);
 	if (page_same_filled(mem, &element)) {
@@ -1482,7 +1485,7 @@ static int zram_write_page(struct zram *zram, struct page *page, u32 index)
 	kunmap_atomic(mem);
 
 #ifdef CONFIG_ZRAM_MULTI_COMP
-	prio_max = min_t(u8, (u8)zram->num_active_comps,
+	prio_max = min_t(u8, ZRAM_MAX_COMPS,
 			 sysctl_zram_recomp_immediate + 1);
 #endif
 	/* A fully initialized ZRAM device always has the primary compressor. */
@@ -1497,6 +1500,10 @@ static int zram_write_page(struct zram *zram, struct page *page, u32 index)
 	for (prio = ZRAM_PRIMARY_COMP; prio < prio_max; prio++) {
 		if (!zram->comps[prio])
 			continue;
+
+#ifdef CONFIG_ZRAM_MULTI_COMP
+		tried_comps++;
+#endif
 
 		zstrm = zcomp_stream_get(zram->comps[prio]);
 		src = kmap_atomic(page);
@@ -1529,7 +1536,8 @@ static int zram_write_page(struct zram *zram, struct page *page, u32 index)
 		zstrm = zcomp_stream_get(zram->comps[selected_prio]);
 		comp_len = PAGE_SIZE;
 #ifdef CONFIG_ZRAM_MULTI_COMP
-		incompressible = prio_max >= (u8)zram->num_active_comps;
+		incompressible =
+			tried_comps == (u8)zram->num_active_comps;
 #endif
 	}
 
