@@ -18,13 +18,22 @@ enum {
 	STEP_LOG2 = 5 /* ==3 #2 avg drop in CR */
 };
 
+#define HT_SIZE (1U << HT_LOG2)
+
+struct lz4kd_hash_entry {
+	uint16_t offset;
+	uint16_t generation;
+};
+
+struct lz4kd_state {
+	uint16_t generation;
+	uint16_t reserved;
+	struct lz4kd_hash_entry table[HT_SIZE];
+};
+
 static unsigned encode_state_bytes_min(void)
 {
-	enum {
-		BYTES_LOG2 = HT_LOG2 + 1
-	};
-	const unsigned bytes_total = (1U << BYTES_LOG2);
-	return bytes_total;
+	return sizeof(struct lz4kd_state);
 }
 
 #if !defined(LZ4K_DELTA) && !defined(LZ4K_MAX_CR)
@@ -36,6 +45,47 @@ unsigned lz4kd_encode_state_bytes_min(void)
 EXPORT_SYMBOL(lz4kd_encode_state_bytes_min);
 
 #endif /* !defined(LZ4K_DELTA) && !defined(LZ4K_MAX_CR) */
+
+static inline uint16_t lz4kd_next_generation(struct lz4kd_state *state)
+{
+	uint16_t generation = state->generation + 1;
+
+	if (unlikely(!generation)) {
+		m_set(state->table, 0, sizeof(state->table));
+		generation = 1;
+	}
+	state->generation = generation;
+	return generation;
+}
+
+static inline const uint8_t *hashed_generation(
+	const uint8_t *const in0,
+	struct lz4kd_state *const state,
+	const uint16_t generation,
+	uint_fast32_t h,
+	const uint8_t *r)
+{
+	struct lz4kd_hash_entry *entry = &state->table[h];
+	const uint8_t *q = entry->generation == generation ?
+		in0 + entry->offset : in0;
+
+	entry->offset = (uint16_t)(r - in0);
+	entry->generation = generation;
+	return q;
+}
+
+static inline void hash_store_generation(
+	const uint8_t *const in0,
+	struct lz4kd_state *const state,
+	const uint16_t generation,
+	uint_fast32_t h,
+	const uint8_t *r)
+{
+	struct lz4kd_hash_entry *entry = &state->table[h];
+
+	entry->offset = (uint16_t)(r - in0);
+	entry->generation = generation;
+}
 
 /* minimum encoded size for non-compressible data */
 inline static uint_fast32_t encoded_bytes_min(
@@ -241,7 +291,7 @@ static const uint8_t *repeat_end(
 	do {
 		const uint64_t x = read8_at(q) ^ read8_at(r);
 		if (x) {
-			const uint16_t ctz = (uint16_t)__builtin_ctzl(x);
+			const uint16_t ctz = (uint16_t)__builtin_ctzll(x);
 			return r + (ctz >> BYTE_BITS_LOG2);
 		}
 		/* some bytes differ: count of trailing 0-bits/bytes */
@@ -291,7 +341,8 @@ inline static uint_fast32_t hash(const uint8_t *r)
  */
 
 static int encode_any(
-	uint16_t *const ht,
+	struct lz4kd_state *const state,
+	const uint16_t generation,
 	const uint8_t *const in0,
 	const uint8_t *const in_end,
 	uint8_t *const out,
@@ -312,10 +363,10 @@ static int encode_any(
 		const uint8_t *r_end = 0;
 		uint_fast32_t r_bytes_max = 0;
 		while (true) {
-			if (equal4(q = hashed(in0, ht, hash(r), r), r))
+			if (equal4(q = hashed_generation(in0, state, generation, hash(r), r), r))
 				break;
 			++r;
-			if (equal4(q = hashed(in0, ht, hash(r), r), r))
+			if (equal4(q = hashed_generation(in0, state, generation, hash(r), r), r))
 				break;
 			if (unlikely((r += (++step >> STEP_LOG2)) > in_end_safe))
 				return out_tail(out_at, out_end, out, nr0, in_end,
@@ -333,7 +384,8 @@ static int encode_any(
 		if (unlikely((r += r_bytes_max) > in_end_safe))
 			return out_tail2(out_at, out_end, out, r, in_end,
 					 NR_LOG2, OFF_LOG2);
-		ht[hash(r - 1)] = (uint16_t)(r - 1 - in0);
+		hash_store_generation(in0, state, generation,
+				      hash(r - 1), r - 1);
 	}
 }
 
@@ -345,7 +397,11 @@ int lz4kd_encode_fast(
 	const uint_fast32_t in_max,
 	const uint_fast32_t out_max)
 {
-	return encode_any((uint16_t*)state, in, in + in_max, out, out + out_max);
+	struct lz4kd_state *workmem = state;
+	uint16_t generation = lz4kd_next_generation(workmem);
+
+	return encode_any(workmem, generation, in, in + in_max,
+			  out, out + out_max);
 }
 
 int lz4kd_encode(

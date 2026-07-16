@@ -129,6 +129,8 @@ inline static U32 hash64_6b(const uint8_t *r, U32 shift)
  * Return: Number of bytes written into buffer 'dest'
  *	(necessarily <= dest_max) or -1 if compression fails
  */
+unsigned int lz4k_state_bytes_min(void);
+
 int lz4k_compress(
 	void *const state,
 	const void *const source,

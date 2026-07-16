@@ -189,7 +189,7 @@ static int decompress(
 	const BYTE *const source_end_minus_x = source_end - TOKEN_BYTES_MAX;
 	BYTE *dest_at = dest;
 	while (likely(source_at <= source_end_minus_x)) {
-		const U32 token = (*(U32 *)(source_at)) & MASK_3B;
+		const U32 token = read4_at(source_at) & MASK_3B;
 		const U32 offset = token & mask(off_log2);
 		U32 lit_length = token >> (off_log2 + match_log2),
 			      match_length = ((token >> off_log2) & mask(match_log2)) +
@@ -201,12 +201,16 @@ static int decompress(
 		/* get literal length and decompress */
 		if (unlikely(lit_length == mask(lit_log2))) {
 			source_at = get_size(&lit_length, source_at, source_end);
+			if (unlikely(!source_at))
+				return -1;
 		}
 		if (!literal_decompress(&source_at, &dest_at, lit_length, source_end, dest_end))
 			return -1;
 		/* get match length and decompress */
 		if (unlikely(match_length == mask(match_log2) + REPEAT_MIN)) {
 			source_at = get_size(&match_length, source_at, source_end);
+			if (unlikely(!source_at))
+				return -1;
 		}
 		dest_from = dest_at - offset;
 		if (unlikely(dest_from < dest))
@@ -241,6 +245,10 @@ int lz4k_decompress(
 	unsigned source_max,
 	unsigned dest_max)
 {
+	if (unlikely(!source || !dest || source_max < TOKEN_BYTES_MAX ||
+		     !dest_max))
+		return -1;
+
 	/* preventing compiler optimizations */
 	const BYTE *volatile source_end = (const BYTE*)source + source_max;
 	const BYTE *volatile dest_end = (BYTE*)dest + dest_max;

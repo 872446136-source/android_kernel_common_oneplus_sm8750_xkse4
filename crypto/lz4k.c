@@ -2,7 +2,7 @@
 #include <linux/init.h>
 #include <linux/module.h>
 #include <linux/crypto.h>
-#include <linux/vmalloc.h>
+#include <linux/slab.h>
 #include <linux/lz4k.h>
 #include <crypto/algapi.h>
 
@@ -14,7 +14,7 @@ static int lz4k_init(struct crypto_tfm *tfm)
 {
 	struct lz4k_ctx *ctx = crypto_tfm_ctx(tfm);
 
-	ctx->workmem = vmalloc(2 * PAGE_SIZE);
+	ctx->workmem = kvzalloc(lz4k_state_bytes_min(), GFP_KERNEL | __GFP_NOWARN);
 	return ctx->workmem ? 0 : -ENOMEM;
 }
 
@@ -22,7 +22,7 @@ static void lz4k_exit(struct crypto_tfm *tfm)
 {
 	struct lz4k_ctx *ctx = crypto_tfm_ctx(tfm);
 
-	vfree(ctx->workmem);
+	kvfree(ctx->workmem);
 }
 
 static int lz4k_compress_crypto(struct crypto_tfm *tfm, const u8 *src,
@@ -32,7 +32,7 @@ static int lz4k_compress_crypto(struct crypto_tfm *tfm, const u8 *src,
 	int ret = lz4k_compress(ctx->workmem, src, dst, slen, *dlen);
 
 	if (ret < 0)
-		return -EINVAL;
+		return -ENOSPC;
 	*dlen = ret;
 	return 0;
 }

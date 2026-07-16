@@ -4,17 +4,64 @@
 #define NR_COPY_MIN (1 << NR_COPY_LOG2)
 #define HT_LOG2 12
 #define STEP_LOG2 5
+#define HT_SIZE (1U << HT_LOG2)
 
+struct lz4k_hash_entry {
+	U16 offset;
+	U16 generation;
+};
 
-inline static const BYTE *hashed(
+struct lz4k_state {
+	U16 generation;
+	U16 reserved;
+	struct lz4k_hash_entry table[HT_SIZE];
+};
+
+unsigned int lz4k_state_bytes_min(void)
+{
+	return sizeof(struct lz4k_state);
+}
+EXPORT_SYMBOL(lz4k_state_bytes_min);
+
+static inline U16 lz4k_next_generation(struct lz4k_state *state)
+{
+	U16 generation = state->generation + 1;
+
+	if (unlikely(!generation)) {
+		m_set(state->table, 0, sizeof(state->table));
+		generation = 1;
+	}
+	state->generation = generation;
+	return generation;
+}
+
+static inline const BYTE *hashed(
 	const BYTE *const base,
-	U16 *const dict,
+	struct lz4k_state *const state,
+	const U16 generation,
 	U32 h,
 	const BYTE *r)
 {
-	const BYTE *q = base + dict[h];
-	dict[h] = (U16)(r - base);
+	struct lz4k_hash_entry *entry = &state->table[h];
+	const BYTE *q = entry->generation == generation ?
+		base + entry->offset : base;
+
+	entry->offset = (U16)(r - base);
+	entry->generation = generation;
 	return q;
+}
+
+static inline void hash_store(
+	const BYTE *const base,
+	struct lz4k_state *const state,
+	const U16 generation,
+	U32 h,
+	const BYTE *r)
+{
+	struct lz4k_hash_entry *entry = &state->table[h];
+
+	entry->offset = (U16)(r - base);
+	entry->generation = generation;
 }
 
 inline static U32 size_bytes_count(U32 u)
@@ -198,7 +245,7 @@ static const BYTE *repeat_end(
 	do {
 		const U64 x = read8_at(q) ^ read8_at(r);
 		if (x) {
-			const U16 ctz = (U16)__builtin_ctzl(x);
+			const U16 ctz = (U16)__builtin_ctzll(x);
 			return r + (ctz >> BYTE_BITS_LOG2);
 		}
 		/* some bytes differ: count of trailing 0-bits/bytes */
@@ -219,7 +266,8 @@ inline static U32 hash(const BYTE *r)
 }
 
 static int compress_64k(
-	U16 *const dict,
+	struct lz4k_state *const state,
+	const U16 generation,
 	const BYTE *const base,
 	const BYTE *const source_end,
 	BYTE *const dest,
@@ -240,10 +288,10 @@ static int compress_64k(
 		const BYTE *r_end = 0;
 		U32 match_length = 0;
 		while (true) {
-			if (equal4(q = hashed(base, dict, hash(r), r), r))
+			if (equal4(q = hashed(base, state, generation, hash(r), r), r))
 				break;
 			++r;
-			if (equal4(q = hashed(base, dict, hash(r), r), r))
+			if (equal4(q = hashed(base, state, generation, hash(r), r), r))
 				break;
 			if (unlikely((r += (++step >> STEP_LOG2)) > source_end_safe))
 				return dest_tail(dest_at, dest_end, dest, nr0, source_end,
@@ -263,7 +311,7 @@ static int compress_64k(
 			return dest_tail2(dest_at, dest_end, dest, r, source_end,
 					 NR_LOG2, OFF_LOG2);
 		/* update r-1 every iters, no need to worry about overflows since r >= 1 */
-		dict[hash(r - 1)] = (U16)(r - 1 - base);
+		hash_store(base, state, generation, hash(r - 1), r - 1);
 	}
 }
 
@@ -274,10 +322,16 @@ int lz4k_compress(
 	unsigned source_max,
 	unsigned dest_max)
 {
-	m_set(state, 0, 1U << (HT_LOG2+1));
-	*((BYTE*)dest) = 0;
-	return compress_64k((U16*)state, (const BYTE*)source,
-			(const BYTE*)source + source_max, (BYTE*)dest, (BYTE*)dest + dest_max);
+	struct lz4k_state *workmem = state;
+	U16 generation;
+
+	if (unlikely(!workmem || !source || !dest || !source_max || !dest_max))
+		return -1;
+
+	generation = lz4k_next_generation(workmem);
+	return compress_64k(workmem, generation, (const BYTE *)source,
+			(const BYTE *)source + source_max, (BYTE *)dest,
+			(BYTE *)dest + dest_max);
 }
 EXPORT_SYMBOL(lz4k_compress);
 
