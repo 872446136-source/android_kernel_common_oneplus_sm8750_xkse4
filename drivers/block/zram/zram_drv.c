@@ -1040,9 +1040,6 @@ static int __comp_algorithm_store(struct zram *zram, u32 prio, const char *buf)
 	if (sz > 0 && compressor[sz - 1] == '\n')
 		compressor[sz - 1] = 0x00;
 
-	pr_info("compressor request: priority=%u algorithm=%s caller=%s[%d]\n",
-		prio, compressor, current->comm, current->pid);
-
 	if (!zcomp_available_algorithm(compressor)) {
 		kfree(compressor);
 		return -EINVAL;
