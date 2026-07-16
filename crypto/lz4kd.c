@@ -29,9 +29,11 @@ static int lz4kd_compress_crypto(struct crypto_tfm *tfm, const u8 *src,
 		unsigned int slen, u8 *dst, unsigned int *dlen)
 {
 	struct lz4kd_ctx *ctx = crypto_tfm_ctx(tfm);
-	int ret = lz4kd_encode(ctx->workmem, src, dst, slen, *dlen, 0);
+	int ret = lz4kd_encode(ctx->workmem, src, dst, slen, *dlen, *dlen);
 
-	if (ret <= 0)
+	if (ret == LZ4K_STATUS_INCOMPRESSIBLE)
+		return -ENOSPC;
+	if (ret < 0)
 		return -EINVAL;
 	*dlen = ret;
 	return 0;

@@ -19,6 +19,7 @@ enum {
 };
 
 #define HT_SIZE (1U << HT_LOG2)
+#define LZ4KD_STATE_MAGIC 0x4c5a344bU
 
 struct lz4kd_hash_entry {
 	uint16_t offset;
@@ -26,6 +27,7 @@ struct lz4kd_hash_entry {
 };
 
 struct lz4kd_state {
+	uint32_t magic;
 	uint16_t generation;
 	uint16_t reserved;
 	struct lz4kd_hash_entry table[HT_SIZE];
@@ -48,8 +50,14 @@ EXPORT_SYMBOL(lz4kd_encode_state_bytes_min);
 
 static inline uint16_t lz4kd_next_generation(struct lz4kd_state *state)
 {
-	uint16_t generation = state->generation + 1;
+	uint16_t generation;
 
+	if (unlikely(state->magic != LZ4KD_STATE_MAGIC)) {
+		m_set(state, 0, sizeof(*state));
+		state->magic = LZ4KD_STATE_MAGIC;
+	}
+
+	generation = state->generation + 1;
 	if (unlikely(!generation)) {
 		m_set(state->table, 0, sizeof(state->table));
 		generation = 1;
@@ -431,9 +439,10 @@ int lz4kd_encode(
 		return LZ4K_STATUS_FAILED; /* pointer overflow */
 	if (in_max > (1 << BLOCK_4KB_LOG2))
 		return LZ4K_STATUS_FAILED;
-	if (unlikely(!out_limit || out_limit > io_min))
+	if (unlikely(!out_limit))
 		out_limit = (unsigned)io_min;
-	m_set(state, 0, encode_state_bytes_min());
+	else if (unlikely(out_limit > out_max))
+		out_limit = out_max;
 	*((uint8_t*)out) = 0; /* lz4kd header */
 	if (unlikely(nr_encoded_bytes_max(in_max, NR_4KB_LOG2) > out_max))
 		return 0;
