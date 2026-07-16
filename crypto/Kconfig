@@ -1268,6 +1268,14 @@ config CRYPTO_LZ4
 
 	  See https://github.com/lz4/lz4 for further information.
 
+config CRYPTO_LZ4K
+	tristate "Oplus LZ4K compression algorithm"
+	select CRYPTO_ALGAPI
+	select LZ4K_COMPRESS
+	select LZ4K_DECOMPRESS
+	help
+	  Oplus page-oriented LZ4K compressor from HybridSwap ZRAM.
+
 config CRYPTO_LZ4HC
 	tristate "LZ4HC"
 	select CRYPTO_ALGAPI
