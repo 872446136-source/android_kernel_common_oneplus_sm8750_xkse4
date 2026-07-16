@@ -2308,7 +2308,11 @@ static enum compact_result __compact_finished(struct compact_control *cc)
 
 out:
 	trace_android_vh_compact_finished(&abort_compact);
-	if (cc->contended || fatal_signal_pending(current) || abort_compact)
+	/* Oplus abort_mm_opt: allow SIGUSR2 to stop compaction promptly. */
+	if (cc->contended || fatal_signal_pending(current) ||
+	    (task_sigpending(current) &&
+	     sigismember(&current->pending.signal, SIGUSR2)) ||
+	    abort_compact)
 		ret = COMPACT_CONTENDED;
 
 	return ret;

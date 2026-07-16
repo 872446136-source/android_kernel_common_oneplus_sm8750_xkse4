@@ -19,6 +19,7 @@
 #include <linux/falloc.h>
 #include <linux/fadvise.h>
 #include <linux/sched.h>
+#include <linux/sched/signal.h>
 #include <linux/sched/mm.h>
 #include <linux/mm_inline.h>
 #include <linux/string.h>
@@ -368,7 +369,11 @@ static int madvise_cold_or_pageout_pte_range(pmd_t *pmd,
 	int ret = 0;
 
 	trace_android_vh_madvise_cold_or_pageout_abort(vma, &abort_madvise);
-	if (fatal_signal_pending(current) || abort_madvise)
+	/* Oplus abort_mm_opt: SIGUSR2 cancels userspace reclaim work. */
+	if (fatal_signal_pending(current) ||
+	    (task_sigpending(current) &&
+	     sigismember(&current->pending.signal, SIGUSR2)) ||
+	    abort_madvise)
 		return -EINTR;
 
 	trace_android_vh_madvise_pageout_bypass(mm, pageout, &ret);
