@@ -14,6 +14,7 @@
 
 #include <linux/mm.h>
 #include <linux/sched/mm.h>
+#include <linux/sched/rt.h>
 #include <linux/module.h>
 #include <linux/gfp.h>
 #include <linux/kernel_stat.h>
@@ -668,6 +669,32 @@ static inline bool can_reclaim_anon_pages(struct mem_cgroup *memcg,
  * As the data only determines if reclaim or compaction continues, it is
  * not expected that isolated folios will be a dominating factor.
  */
+
+/* Aggressive Oplus-style reclaim policy, integrated without HybridSwap. */
+#define OPLUS_KSWAPD_SWAPPINESS	180
+#define OPLUS_DIRECT_SWAPPINESS	40
+#define OPLUS_SWAP_RESERVE_PERCENT	2
+
+static int oplus_context_swappiness(int swappiness)
+{
+	unsigned long total = READ_ONCE(total_swap_pages);
+	unsigned long free = get_nr_swap_pages();
+	unsigned long reserve;
+
+	if (!swappiness || !total)
+		return 0;
+
+	reserve = max_t(unsigned long, SWAP_CLUSTER_MAX,
+			(total * OPLUS_SWAP_RESERVE_PERCENT) / 100);
+	if (free <= reserve)
+		return 0;
+
+	if (current_is_kswapd())
+		return max(swappiness, OPLUS_KSWAPD_SWAPPINESS);
+
+	return min(swappiness, OPLUS_DIRECT_SWAPPINESS);
+}
+
 unsigned long zone_reclaimable_pages(struct zone *zone)
 {
 	unsigned long nr;
@@ -1255,6 +1282,13 @@ void reclaim_throttle(pg_data_t *pgdat, enum vmscan_throttle_state reason)
 	 */
 	if (!current_is_kswapd() &&
 	    current->flags & (PF_USER_WORKER|PF_KTHREAD)) {
+		cond_resched();
+		return;
+	}
+
+	/* Oplus zram_opt: never stall RT or negative-nice tasks here. */
+	if (!current_is_kswapd() &&
+	    (rt_task(current) || task_nice(current) < 0)) {
 		cond_resched();
 		return;
 	}
@@ -3207,6 +3241,7 @@ static void get_scan_count(struct lruvec *lruvec, struct scan_control *sc,
 
 
 	trace_android_vh_tune_swappiness(&swappiness);
+	swappiness = oplus_context_swappiness(swappiness);
 	/*
 	 * Global reclaim will swap to prevent OOM even with no
 	 * swappiness, but memcg users want to use this knob to
@@ -3237,6 +3272,17 @@ static void get_scan_count(struct lruvec *lruvec, struct scan_control *sc,
 		goto out;
 	}
 
+	if (!cgroup_reclaim(sc)) {
+		struct zone *normal = &pgdat->node_zones[ZONE_NORMAL];
+
+		if (managed_zone(normal)) {
+			unsigned long threshold = low_wmark_pages(normal) +
+				((high_wmark_pages(normal) - low_wmark_pages(normal)) >> 1);
+
+			balance_anon_file_reclaim =
+				zone_page_state(normal, NR_FREE_PAGES) >= threshold;
+		}
+	}
 	trace_android_rvh_set_balance_anon_file_reclaim(&balance_anon_file_reclaim);
 
 	/*
@@ -3590,6 +3636,7 @@ static int get_swappiness(struct lruvec *lruvec, struct scan_control *sc)
 
 	swappiness = mem_cgroup_swappiness(memcg);
 	trace_android_vh_tune_swappiness(&swappiness);
+	swappiness = oplus_context_swappiness(swappiness);
 
 	return swappiness;
 }
