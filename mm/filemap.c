@@ -15,6 +15,8 @@
 #include <linux/dax.h>
 #include <linux/fs.h>
 #include <linux/sched/signal.h>
+#include <linux/sched/rt.h>
+#include <linux/vmstat.h>
 #include <linux/uaccess.h>
 #include <linux/capability.h>
 #include <linux/kernel_stat.h>
@@ -3252,6 +3254,31 @@ static int lock_folio_maybe_drop_mmap(struct vm_fault *vmf, struct folio *folio,
  * that.  If we didn't pin a file then we return NULL.  The file that is
  * returned needs to be fput()'ed when we're done with it.
  */
+
+/* Oplus dynamic_readahead, integrated directly into the MM paths. */
+static bool oplus_mmap_readahead_latency_sensitive(void)
+{
+	return rt_task(current) || task_nice(current) < 0;
+}
+
+static bool oplus_mmap_readahead_lowmem(void)
+{
+	static unsigned long cached_high_wmark;
+	unsigned long high_wmark = READ_ONCE(cached_high_wmark);
+	struct zone *zone;
+
+	if (unlikely(!high_wmark)) {
+		for_each_zone(zone) {
+			if (managed_zone(zone))
+				high_wmark += high_wmark_pages(zone);
+		}
+		high_wmark = max(high_wmark, 1UL);
+		WRITE_ONCE(cached_high_wmark, high_wmark);
+	}
+
+	return global_zone_page_state(NR_FREE_PAGES) < high_wmark;
+}
+
 static struct file *do_sync_mmap_readahead(struct vm_fault *vmf)
 {
 	struct file *file = vmf->vma->vm_file;
@@ -3261,6 +3288,7 @@ static struct file *do_sync_mmap_readahead(struct vm_fault *vmf)
 	struct file *fpin = NULL;
 	unsigned long vm_flags = vmf->vma->vm_flags;
 	unsigned int mmap_miss;
+	unsigned int readaround_pages;
 
 #ifdef CONFIG_TRANSPARENT_HUGEPAGE
 	/* Use the readahead code, even if readahead is disabled */
@@ -3311,9 +3339,14 @@ static struct file *do_sync_mmap_readahead(struct vm_fault *vmf)
 	 * mmap read-around
 	 */
 	fpin = maybe_unlock_mmap_for_io(vmf, fpin);
-	ra->start = max_t(long, 0, vmf->pgoff - ra->ra_pages / 2);
-	ra->size = ra->ra_pages;
-	ra->async_size = ra->ra_pages / 4;
+	readaround_pages = ra->ra_pages;
+	/* Match Oplus low-memory read-around throttling without sched_assist. */
+	if (!oplus_mmap_readahead_latency_sensitive() &&
+	    oplus_mmap_readahead_lowmem())
+		readaround_pages = max_t(unsigned int, 1, readaround_pages >> 1);
+	ra->start = max_t(long, 0, vmf->pgoff - readaround_pages / 2);
+	ra->size = readaround_pages;
+	ra->async_size = max_t(unsigned int, 1, readaround_pages / 4);
 	trace_android_vh_tune_mmap_readaround(ra->ra_pages, vmf->pgoff,
 			&ra->start, &ra->size, &ra->async_size);
 	ractl._index = ra->start;

@@ -128,6 +128,8 @@
 #include <linux/blk-cgroup.h>
 #include <linux/fadvise.h>
 #include <linux/sched/mm.h>
+#include <linux/sched/rt.h>
+#include <linux/vmstat.h>
 #include <trace/hooks/mm.h>
 
 #include "internal.h"
@@ -570,6 +572,31 @@ fallback:
 /*
  * A minimal readahead algorithm for trivial sequential/random reads.
  */
+
+/* Oplus dynamic_readahead, integrated directly into the MM paths. */
+static bool oplus_readahead_latency_sensitive(void)
+{
+	return rt_task(current) || task_nice(current) < 0;
+}
+
+static bool oplus_readahead_lowmem(void)
+{
+	static unsigned long cached_high_wmark;
+	unsigned long high_wmark = READ_ONCE(cached_high_wmark);
+	struct zone *zone;
+
+	if (unlikely(!high_wmark)) {
+		for_each_zone(zone) {
+			if (managed_zone(zone))
+				high_wmark += high_wmark_pages(zone);
+		}
+		high_wmark = max(high_wmark, 1UL);
+		WRITE_ONCE(cached_high_wmark, high_wmark);
+	}
+
+	return global_zone_page_state(NR_FREE_PAGES) < high_wmark;
+}
+
 static void ondemand_readahead(struct readahead_control *ractl,
 		struct folio *folio, unsigned long req_size)
 {
@@ -587,6 +614,11 @@ static void ondemand_readahead(struct readahead_control *ractl,
 	 */
 	if (req_size > max_pages && bdi->io_pages > max_pages)
 		max_pages = min(req_size, bdi->io_pages);
+
+	/* Halve speculative background I/O below the aggregate high watermark. */
+	if (!oplus_readahead_latency_sensitive() && oplus_readahead_lowmem())
+		max_pages = max_t(unsigned long, req_size,
+				max_t(unsigned long, 1, max_pages >> 1));
 
 	trace_android_vh_ra_tuning_max_page(ractl, &max_pages);
 
