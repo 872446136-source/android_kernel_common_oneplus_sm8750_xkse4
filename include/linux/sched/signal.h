@@ -418,6 +418,31 @@ static inline int fatal_signal_pending(struct task_struct *p)
 	return task_sigpending(p) && __fatal_signal_pending(p);
 }
 
+/*
+ * Test a particular pending signal in both the thread-private and
+ * process-shared pending queues. Take sighand->siglock so the signal
+ * sets are observed consistently.
+ */
+static inline bool task_specific_signal_pending(struct task_struct *p, int sig)
+{
+	struct sighand_struct *sighand;
+	unsigned long flags;
+	bool pending;
+
+	if (!task_sigpending(p))
+		return false;
+
+	sighand = lock_task_sighand(p, &flags);
+	if (!sighand)
+		return false;
+
+	pending = sigismember(&p->pending.signal, sig) ||
+		  sigismember(&p->signal->shared_pending.signal, sig);
+
+	unlock_task_sighand(p, &flags);
+	return pending;
+}
+
 static inline int signal_pending_state(unsigned int state, struct task_struct *p)
 {
 	if (!(state & (TASK_INTERRUPTIBLE | TASK_WAKEKILL)))

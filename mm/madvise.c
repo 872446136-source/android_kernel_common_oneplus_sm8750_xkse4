@@ -371,8 +371,7 @@ static int madvise_cold_or_pageout_pte_range(pmd_t *pmd,
 	trace_android_vh_madvise_cold_or_pageout_abort(vma, &abort_madvise);
 	/* Oplus abort_mm_opt: SIGUSR2 cancels userspace reclaim work. */
 	if (fatal_signal_pending(current) ||
-	    (task_sigpending(current) &&
-	     sigismember(&current->pending.signal, SIGUSR2)) ||
+	    task_specific_signal_pending(current, SIGUSR2) ||
 	    abort_madvise)
 		return -EINTR;
 
