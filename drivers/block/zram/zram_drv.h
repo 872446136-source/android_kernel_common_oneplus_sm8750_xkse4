@@ -89,7 +89,12 @@ struct zram_stats {
 #ifdef	CONFIG_ZRAM_WRITEBACK
 	atomic64_t bd_count;		/* no. of pages in backing device */
 	atomic64_t bd_reads;		/* no. of reads from backing device */
-	atomic64_t bd_writes;		/* no. of writes from backing device */
+	atomic64_t bd_writes;		/* no. of writes to backing device */
+	atomic64_t wb_batches;		/* contiguous multi-page writeback I/O */
+	atomic64_t wb_batch_pages;	/* pages submitted through batches */
+	atomic64_t wb_batch_fallbacks;	/* fragmented backing fallback count */
+	atomic64_t wb_alloc_failures;	/* backing block allocation failures */
+	atomic64_t wb_io_errors;	/* backing write I/O failures */
 #endif
 };
 
@@ -135,6 +140,8 @@ struct zram {
 	struct block_device *bdev;
 	unsigned long *bitmap;
 	unsigned long nr_pages;
+	spinlock_t bitmap_lock;
+	unsigned long wb_next_block;
 #endif
 #ifdef CONFIG_ZRAM_MEMORY_TRACKING
 	struct dentry *debugfs_dir;
