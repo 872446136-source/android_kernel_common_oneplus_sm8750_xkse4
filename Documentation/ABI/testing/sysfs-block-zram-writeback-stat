@@ -1,0 +1,14 @@
+What:		/sys/block/zram<id>/writeback_stat
+Date:		July 2026
+Contact:	xkse4 <xkse4@outlook.com>
+Description:
+		Read-only counters for the contiguous ZRAM backing-write path.
+
+		The five whitespace-separated unsigned values are:
+
+		1. multi-page batches submitted successfully
+		2. pages submitted through multi-page batches
+		3. contiguous-allocation fallbacks to single-page I/O
+		4. backing-block allocation failures
+		5. backing write I/O failures
+Users:		ZRAM diagnostics and regression testing

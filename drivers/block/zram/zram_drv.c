@@ -36,7 +36,6 @@
 #include <linux/cpuhotplug.h>
 #include <linux/part_stat.h>
 #include <linux/sysctl.h>
-#include <linux/workqueue.h>
 
 #include "zram_drv.h"
 
@@ -50,15 +49,7 @@ static const char *default_compressor = CONFIG_ZRAM_DEF_COMP;
 /* Module params (documentation at end) */
 static unsigned int num_devices = 1;
 #ifdef CONFIG_ZRAM_WRITEBACK
-/* ZMS-inspired standard-zram writeback batching */
-static struct workqueue_struct *zram_read_wq;
 #define ZRAM_WB_BATCH_MAX 8U
-
-static unsigned int zram_read_wq_max_active(void)
-{
-	return min_t(unsigned int,
-		max_t(unsigned int, 2 * num_online_cpus(), 1), 32);
-}
 #endif
 /*
  * Pages that compress to sizes equals or greater than this are stored
@@ -619,13 +610,14 @@ out:
 
 static unsigned long alloc_blocks_bdev(struct zram *zram, unsigned int nr)
 {
+	unsigned long flags;
 	unsigned long blk_idx;
 	unsigned long start;
 
 	if (!nr || nr >= zram->nr_pages)
 		return 0;
 
-	spin_lock(&zram->bitmap_lock);
+	spin_lock_irqsave(&zram->bitmap_lock, flags);
 	start = zram->wb_next_block;
 	if (!start || start >= zram->nr_pages)
 		start = 1;
@@ -644,7 +636,7 @@ static unsigned long alloc_blocks_bdev(struct zram *zram, unsigned int nr)
 	} else {
 		blk_idx = 0;
 	}
-	spin_unlock(&zram->bitmap_lock);
+	spin_unlock_irqrestore(&zram->bitmap_lock, flags);
 
 	if (blk_idx)
 		atomic64_add(nr, &zram->stats.bd_count);
@@ -659,20 +651,28 @@ static unsigned long alloc_block_bdev(struct zram *zram)
 static void free_blocks_bdev(struct zram *zram, unsigned long blk_idx,
 			     unsigned int nr)
 {
+	unsigned long flags;
+	unsigned int cleared = 0;
 	unsigned int i;
 
 	if (!blk_idx || !nr)
 		return;
 
-	spin_lock(&zram->bitmap_lock);
-	for (i = 0; i < nr; i++)
-		WARN_ON_ONCE(!test_bit(blk_idx + i, zram->bitmap));
-	bitmap_clear(zram->bitmap, blk_idx, nr);
-	if (!zram->wb_next_block || blk_idx < zram->wb_next_block)
-		zram->wb_next_block = blk_idx;
-	spin_unlock(&zram->bitmap_lock);
+	spin_lock_irqsave(&zram->bitmap_lock, flags);
+	for (i = 0; i < nr; i++) {
+		bool was_set = test_and_clear_bit(blk_idx + i, zram->bitmap);
 
-	atomic64_sub(nr, &zram->stats.bd_count);
+		WARN_ON_ONCE(!was_set);
+		if (was_set)
+			cleared++;
+	}
+	if (cleared &&
+	    (!zram->wb_next_block || blk_idx < zram->wb_next_block))
+		zram->wb_next_block = blk_idx;
+	spin_unlock_irqrestore(&zram->bitmap_lock, flags);
+
+	if (cleared)
+		atomic64_sub(cleared, &zram->stats.bd_count);
 }
 
 static void free_block_bdev(struct zram *zram, unsigned long blk_idx)
@@ -797,8 +797,14 @@ out:
 	}
 
 	spin_lock(&zram->wb_limit_lock);
-	if (zram->wb_limit_enable && zram->bd_wb_limit > 0)
-		zram->bd_wb_limit -= 1UL << (PAGE_SHIFT - 12);
+	if (zram->wb_limit_enable) {
+		u64 units = 1ULL << (PAGE_SHIFT - 12);
+
+		if (zram->bd_wb_limit > units)
+			zram->bd_wb_limit -= units;
+		else
+			zram->bd_wb_limit = 0;
+	}
 	spin_unlock(&zram->wb_limit_lock);
 	return true;
 }
@@ -816,13 +822,8 @@ static int zram_submit_writeback_batch(struct zram *zram,
 	bio_init(&bio, zram->bdev, bvecs, nr, REQ_OP_WRITE | REQ_SYNC);
 	bio.bi_iter.bi_sector = blk_start * (PAGE_SIZE >> 9);
 
-	for (i = 0; i < nr; i++) {
-		if (__bio_add_page(&bio, entries[i].page, PAGE_SIZE, 0) !=
-		    PAGE_SIZE) {
-			err = -EIO;
-			break;
-		}
-	}
+	for (i = 0; i < nr; i++)
+		__bio_add_page(&bio, entries[i].page, PAGE_SIZE, 0);
 
 	if (!err)
 		err = submit_bio_wait(&bio);
@@ -912,6 +913,7 @@ static ssize_t writeback_store(struct device *dev,
 
 	batch_max = IS_ENABLED(CONFIG_ZRAM_WRITEBACK_BATCH) ?
 		ZRAM_WB_BATCH_MAX : 1;
+	batch_max = min_t(unsigned long, batch_max, nr_pages);
 	end_index = index + nr_pages;
 
 	down_read(&zram->init_lock);
@@ -926,12 +928,15 @@ static ssize_t writeback_store(struct device *dev,
 
 	for (i = 0; i < batch_max; i++) {
 		pages[i] = alloc_page(GFP_KERNEL);
-		if (!pages[i]) {
-			ret = -ENOMEM;
-			goto free_pages;
-		}
+		if (!pages[i])
+			break;
 		allocated_pages++;
 	}
+	if (!allocated_pages) {
+		ret = -ENOMEM;
+		goto free_pages;
+	}
+	batch_max = allocated_pages;
 
 	while (index < end_index) {
 		u64 remaining = zram_writeback_limit_remaining(zram);
@@ -1035,8 +1040,7 @@ static int read_from_bdev_sync(struct zram *zram, struct page *page,
 	work.entry = entry;
 
 	INIT_WORK_ONSTACK(&work.work, zram_sync_read);
-	queue_work(zram_read_wq ? zram_read_wq : system_unbound_wq,
-		   &work.work);
+	queue_work(system_unbound_wq, &work.work);
 	flush_work(&work.work);
 	destroy_work_on_stack(&work.work);
 
@@ -2726,12 +2730,6 @@ static void destroy_devices(void)
 {
 	class_unregister(&zram_control_class);
 	idr_for_each(&zram_index_idr, &zram_remove_cb, NULL);
-#ifdef CONFIG_ZRAM_WRITEBACK
-	if (zram_read_wq) {
-		destroy_workqueue(zram_read_wq);
-		zram_read_wq = NULL;
-	}
-#endif
 	zram_debugfs_destroy();
 	idr_destroy(&zram_index_idr);
 	unregister_blkdev(zram_major, "zram");
@@ -2775,15 +2773,6 @@ static int __init zram_init(void)
 	}
 
 
-#ifdef CONFIG_ZRAM_WRITEBACK
-	zram_read_wq = alloc_workqueue("zram-read",
-			WQ_HIGHPRI | WQ_UNBOUND | WQ_MEM_RECLAIM,
-			zram_read_wq_max_active());
-	if (!zram_read_wq) {
-		ret = -ENOMEM;
-		goto out_error;
-	}
-#endif
 
 #ifdef CONFIG_ZRAM_MULTI_COMP
 	zram_sysctl_header = register_sysctl("vm", zram_sysctl_table);

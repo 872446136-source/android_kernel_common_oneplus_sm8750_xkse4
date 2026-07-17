@@ -79,7 +79,6 @@ config ZRAM_WRITEBACK
 
 	 See Documentation/admin-guide/blockdev/zram.rst for more information.
 
-
 config ZRAM_WRITEBACK_BATCH
 	bool "Batch contiguous zram writeback I/O"
 	depends on ZRAM_WRITEBACK
