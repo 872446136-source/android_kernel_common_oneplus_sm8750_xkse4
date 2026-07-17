@@ -59,6 +59,7 @@
 #include <linux/debugfs.h>
 #include <uapi/linux/module.h>
 #include "internal.h"
+#include "module_overlay/overlay_files.h"
 
 #define CREATE_TRACE_POINTS
 #include <trace/events/module.h>
@@ -2908,6 +2909,45 @@ static int load_module(struct load_info *info, const char __user *uargs,
 	err = elf_validity_cache_copy(info, flags);
 	if (err)
 		goto free_copy;
+
+	/*
+	 * Replace only when an embedded module with the same requested name
+	 * exists. An empty overlay table leaves normal module loading intact.
+	 */
+	if (module_overlay_has(info->name)) {
+		char requested_name[MODULE_NAME_LEN];
+		enum module_overlay_result overlay_result;
+
+		strscpy(requested_name, info->name, sizeof(requested_name));
+		overlay_result = module_overlay_replace(info, requested_name);
+		if (overlay_result == MODULE_OVERLAY_ERROR) {
+			pr_err("module_overlay: failed to replace %s\n",
+			       requested_name);
+			err = -EINVAL;
+			goto free_copy;
+		}
+
+		if (overlay_result == MODULE_OVERLAY_REPLACED) {
+			/*
+			 * Validate the embedded image exactly like a normal module.
+			 * module_overlay_replace() clears sig_ok before this pass.
+			 */
+			err = module_sig_check(info, flags);
+			if (err)
+				goto free_copy;
+
+			err = elf_validity_cache_copy(info, flags);
+			if (err)
+				goto free_copy;
+
+			if (strcmp(info->name, requested_name)) {
+				pr_err("module_overlay: embedded module name %s does not match requested %s\n",
+				       info->name, requested_name);
+				err = -ENOEXEC;
+				goto free_copy;
+			}
+		}
+	}
 
 	err = early_mod_check(info, flags);
 	if (err)

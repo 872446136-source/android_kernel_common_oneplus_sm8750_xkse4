@@ -8,6 +8,7 @@
 KCOV_INSTRUMENT_main.o := n
 
 obj-y += main.o
+obj-y += module_overlay/
 obj-y += strict_rwx.o
 obj-y += kmod.o
 obj-$(CONFIG_MODULE_DEBUG_AUTOLOAD_DUPS) += dups.o
