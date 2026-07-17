@@ -9,8 +9,6 @@
 #include "../firmware.h"
 #include "overlay_files.h"
 
-#define REGDB_OVERLAY_CMDLINE "regdb_overlay.enable"
-
 static const char *firmware_basename(const char *name)
 {
 	const char *basename = strrchr(name, '/');
@@ -30,25 +28,14 @@ static const struct overlay_file *find_overlay(const char *name)
 	return NULL;
 }
 
-static bool regdb_overlay_enabled(void)
-{
-	const char *cmdline = saved_command_line;
-	const size_t option_len = strlen(REGDB_OVERLAY_CMDLINE);
-	const char *value;
-
-	while ((value = strstr(cmdline, REGDB_OVERLAY_CMDLINE))) {
-		if ((value == saved_command_line || isspace(value[-1])) &&
-		    value[option_len] == '=' && value[option_len + 1] == '1' &&
-		    (!value[option_len + 2] || isspace(value[option_len + 2])))
-			return true;
-		cmdline = value + option_len;
-	}
-	return false;
-}
-
 bool should_intercept_firmware(const char *name)
 {
-	return regdb_overlay_enabled() && find_overlay(name);
+	/*
+	 * Presence in the generated overlay table is the only switch:
+	 * matching embedded firmware is replaced; everything else follows
+	 * the normal firmware loader path.
+	 */
+	return find_overlay(name) != NULL;
 }
 
 enum intercept_status intercept_firmware_load(struct firmware *fw,
@@ -60,7 +47,7 @@ enum intercept_status intercept_firmware_load(struct firmware *fw,
 	struct fw_priv *fw_priv;
 	zstd_dctx *dctx;
 
-	if (!ov || !regdb_overlay_enabled())
+	if (!ov)
 		return INTERCEPT_STATUS_SKIP;
 	if (!fw || !fw->priv)
 		return INTERCEPT_STATUS_ERROR;
