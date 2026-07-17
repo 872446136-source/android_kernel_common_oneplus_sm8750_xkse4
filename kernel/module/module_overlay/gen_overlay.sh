@@ -9,7 +9,7 @@ tmp_dir="$(mktemp -d)"
 trap 'rm -rf "$tmp_dir"' EXIT
 
 mapfile -d '' modules < <(
-	find "$modules_dir" -maxdepth 1 -type f -name '*.ko.bin' -print0 |
+	find "$modules_dir" -maxdepth 1 -type f -name '*.payload' -print0 |
 		sort -z
 )
 
@@ -26,7 +26,7 @@ count=0
 
 for module in "${modules[@]}"; do
 	base="$(basename "$module")"
-	name="${base%.ko.bin}"
+	name="${base%.payload}"
 	name="${name//-/_}"
 	array_name="$(printf '%s' "$name" | sed 's/[^a-zA-Z0-9_]/_/g')_zstd"
 	compressed="$tmp_dir/$base.zst"
