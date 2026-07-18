@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0
-#include <linux/kernel_read_file.h>
 #include <linux/module.h>
+#include <linux/security.h>
 #include <linux/string.h>
 #include <linux/vmalloc.h>
 #include <linux/zstd.h>
