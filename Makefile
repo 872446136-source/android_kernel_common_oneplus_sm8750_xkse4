@@ -847,14 +847,9 @@ KBUILD_CFLAGS += -Os
 KBUILD_RUSTFLAGS += -Copt-level=s
 endif
 
+ifeq ($(SRCARCH),arm64)
 KBUILD_CFLAGS += -march=armv8.2-a
-KBUILD_CFLAGS += -mllvm -polly \
-		 -mllvm -polly-run-dce \
-		 -mllvm -polly-run-inliner \
-		 -mllvm -polly-loopfusion-greedy \
-		 -mllvm -polly-ast-use-context \
-		 -mllvm -polly-detect-keep-going \
-		 -mllvm -polly-vectorizer=stripmine
+endif
 
 # Always set `debug-assertions` and `overflow-checks` because their default
 # depends on `opt-level` and `debug-assertions`, respectively.
@@ -1012,7 +1007,7 @@ endif
 ifdef CONFIG_LTO_CLANG
 ifdef CONFIG_LTO_CLANG_THIN
 CC_FLAGS_LTO	:= -flto=thin -fsplit-lto-unit
-KBUILD_LDFLAGS	+= --thinlto-cache-dir=$(extmod_prefix).thinlto-cache --thinlto-jobs=$(nproc --all)
+KBUILD_LDFLAGS	+= --thinlto-cache-dir=$(extmod_prefix).thinlto-cache
 else
 CC_FLAGS_LTO	:= -flto
 endif
