@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0
+#include <linux/kernel_read_file.h>
 #include <linux/module.h>
 #include <linux/string.h>
 #include <linux/vmalloc.h>
@@ -36,6 +37,7 @@ module_overlay_replace(struct load_info *info, const char *name)
 	void *new_hdr = NULL;
 	void *workspace = NULL;
 	zstd_dctx *dctx;
+	int ret;
 	size_t workspace_size;
 	size_t decompressed_size;
 
@@ -66,6 +68,15 @@ module_overlay_replace(struct load_info *info, const char *name)
 	    decompressed_size != overlay->original_size) {
 		pr_err("module_overlay: decompression failed for %s: %zu/%zu\n",
 		       name, decompressed_size, overlay->original_size);
+		goto error;
+	}
+
+	/* Appraise the bytes that will actually be loaded, not only the stub. */
+	ret = security_kernel_post_load_data(new_hdr, decompressed_size,
+					     LOADING_MODULE, "module_overlay");
+	if (ret) {
+		pr_err("module_overlay: security appraisal rejected %s: %d\n",
+		       name, ret);
 		goto error;
 	}
 

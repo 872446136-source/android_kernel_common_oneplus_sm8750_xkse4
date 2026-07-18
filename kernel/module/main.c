@@ -2914,7 +2914,15 @@ static int load_module(struct load_info *info, const char __user *uargs,
 	 * Replace only when an embedded module with the same requested name
 	 * exists. An empty overlay table leaves normal module loading intact.
 	 */
-	if (module_overlay_has(info->name)) {
+	if ((flags & MODULE_INIT_COMPRESSED_FILE) &&
+	    module_overlay_has(info->name)) {
+		/*
+		 * module_decompress_cleanup() owns the vmap-backed buffer and its
+		 * page array. Replacing info->hdr here would make free_copy() tear
+		 * down the replacement using the original compressed-file state.
+		 */
+		pr_warn_once("module_overlay: skipping replacement for compressed module input\n");
+	} else if (module_overlay_has(info->name)) {
 		char requested_name[MODULE_NAME_LEN];
 		enum module_overlay_result overlay_result;
 

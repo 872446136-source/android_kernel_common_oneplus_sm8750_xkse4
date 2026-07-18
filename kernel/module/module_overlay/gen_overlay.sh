@@ -7,6 +7,16 @@ modules_dir="$2"
 
 tmp_dir="$(mktemp -d)"
 trap 'rm -rf "$tmp_dir"' EXIT
+generated="$tmp_dir/overlay_files.c"
+
+command -v zstd >/dev/null 2>&1 || {
+	echo "module_overlay: zstd is required" >&2
+	exit 1
+}
+command -v python3 >/dev/null 2>&1 || {
+	echo "module_overlay: python3 is required" >&2
+	exit 1
+}
 
 mapfile -d '' modules < <(
 	find "$modules_dir" -maxdepth 1 -type f -name '*.payload' -print0 |
@@ -18,7 +28,7 @@ mapfile -d '' modules < <(
 	echo '#include <linux/stddef.h>'
 	echo '#include "overlay_files.h"'
 	echo
-} > "$out_file"
+} > "$generated"
 
 table_file="$tmp_dir/table"
 : > "$table_file"
@@ -34,7 +44,7 @@ for module in "${modules[@]}"; do
 
 	zstd -22 -q -f "$module" -o "$compressed"
 
-	python3 - "$compressed" "$array_name" >> "$out_file" <<'PY'
+	python3 - "$compressed" "$array_name" >> "$generated" <<'PY'
 from pathlib import Path
 import sys
 
@@ -65,6 +75,8 @@ done
 	echo '};'
 	echo
 	printf 'const size_t module_overlay_file_count = %d;\n' "$count"
-} >> "$out_file"
+} >> "$generated"
+
+mv -f "$generated" "$out_file"
 
 echo "GEN     $out_file ($count module overlay(s))"
