@@ -2929,13 +2929,10 @@ static int load_module(struct load_info *info, const char __user *uargs,
 		strscpy(requested_name, info->name, sizeof(requested_name));
 		overlay_result = module_overlay_replace(info, requested_name);
 		if (overlay_result == MODULE_OVERLAY_ERROR) {
-			pr_err("module_overlay: failed to replace %s\n",
-			       requested_name);
-			err = -EINVAL;
-			goto free_copy;
-		}
-
-		if (overlay_result == MODULE_OVERLAY_REPLACED) {
+			/* Replacement errors leave the original image untouched. */
+			pr_warn("module_overlay: failed to replace %s, using original module\n",
+				requested_name);
+		} else if (overlay_result == MODULE_OVERLAY_REPLACED) {
 			/*
 			 * Validate the embedded image exactly like a normal module.
 			 * module_overlay_replace() clears sig_ok before this pass.
