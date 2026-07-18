@@ -1,236 +1,244 @@
+// SPDX-License-Identifier: GPL-2.0
 /*
- * Author: andip71, 01.09.2017
+ * Boeffla wakelock blocker
  *
- * Version 1.1.0
- *
- * This software is licensed under the terms of the GNU General Public
- * License version 2, as published by the Free Software Foundation, and
- * may be copied, distributed, and modified under those terms.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- *
+ * Original implementation by andip71.
  */
 
-/*
- * Change log:
- *
- * 1.1.0 (01.09.2017)
- *   - By default, the following wakelocks are blocked in an own list
- *     qcom_rx_wakelock, wlan, wlan_wow_wl, wlan_extscan_wl, NETLINK
- *
- * 1.0.1 (29.08.2017)
- *   - Add killing wakelock when currently active
- *
- * 1.0.0 (28.08.2017)
- *   - Initial version
- *
- */
-
-#include <linux/module.h>
-#include <linux/kobject.h>
-#include <linux/sysfs.h>
 #include <linux/device.h>
+#include <linux/kernel.h>
 #include <linux/miscdevice.h>
+#include <linux/module.h>
 #include <linux/printk.h>
+#include <linux/spinlock.h>
+#include <linux/string.h>
+#include <linux/sysfs.h>
+
 #include "boeffla_wl_blocker.h"
 
+static char list_wl[LENGTH_LIST_WL];
+static char list_wl_default[LENGTH_LIST_WL_DEFAULT];
+static char list_wl_search[LENGTH_LIST_WL_SEARCH];
+static bool wl_blocker_active;
+static bool wl_blocker_debug;
+static DEFINE_SPINLOCK(wl_blocker_lock);
 
-/*****************************************/
-// Variables
-/*****************************************/
-
-char list_wl[LENGTH_LIST_WL] = {0};
-char list_wl_default[LENGTH_LIST_WL_DEFAULT] = {0};
-
-extern char list_wl_search[LENGTH_LIST_WL_SEARCH];
-extern bool wl_blocker_active;
-extern bool wl_blocker_debug;
-
-
-/*****************************************/
-// internal functions
-/*****************************************/
-
-static void build_search_string(char *list1, char *list2)
+static void build_search_string_locked(void)
 {
-	// store wakelock list and search string (with semicolons added at start and end)
-	sprintf(list_wl_search, ";%s;%s;", list1, list2);
-
-	// set flag if wakelock blocker should be active (for performance reasons)
-	if (strlen(list_wl_search) > 5)
-		wl_blocker_active = true;
-	else
-		wl_blocker_active = false;
+	scnprintf(list_wl_search, sizeof(list_wl_search), ";%s;%s;",
+		  list_wl_default, list_wl);
+	wl_blocker_active = list_wl_default[0] || list_wl[0];
 }
 
-
-/*****************************************/
-// sysfs interface functions
-/*****************************************/
-
-// show list of user configured wakelocks
-static ssize_t wakelock_blocker_show(struct device *dev, struct device_attribute *attr,
-			    char *buf)
+static int copy_sysfs_value(char *dst, size_t dst_size,
+			    const char *buf, size_t count)
 {
-	// return list of wakelocks to be blocked
-	return sprintf(buf, "%s\n", list_wl);
+	size_t len = count;
+
+	while (len && (buf[len - 1] == '\n' || buf[len - 1] == '\r' ||
+		       buf[len - 1] == ' ' || buf[len - 1] == '\t'))
+		len--;
+
+	if (len >= dst_size)
+		return -E2BIG;
+
+	memcpy(dst, buf, len);
+	dst[len] = '\0';
+	return 0;
 }
 
-
-// store list of user configured wakelocks
-static ssize_t wakelock_blocker_store(struct device * dev, struct device_attribute *attr,
-			     const char * buf, size_t n)
+bool boeffla_wl_blocker_should_block(const char *name)
 {
-	int len = n;
+	char token[BOEFFLA_WL_NAME_MAX + 3];
+	unsigned long flags;
+	size_t length;
+	bool blocked;
+	bool debug;
 
-	// check if string is too long to be stored
-	if (len > LENGTH_LIST_WL)
-		return -EINVAL;
+	if (!name)
+		return false;
 
-	// store user configured wakelock list and rebuild search string
-	sscanf(buf, "%s", list_wl);
-	build_search_string(list_wl_default, list_wl);
+	length = strnlen(name, BOEFFLA_WL_NAME_MAX + 1);
+	if (!length || length > BOEFFLA_WL_NAME_MAX)
+		return false;
 
-	return n;
+	scnprintf(token, sizeof(token), ";%s;", name);
+
+	spin_lock_irqsave(&wl_blocker_lock, flags);
+	blocked = wl_blocker_active && strstr(list_wl_search, token);
+	debug = wl_blocker_debug;
+	spin_unlock_irqrestore(&wl_blocker_lock, flags);
+
+	if (debug)
+		pr_info_ratelimited("Boeffla WL blocker: %s %s\n", name,
+				    blocked ? "blocked" : "allowed");
+
+	return blocked;
 }
 
-
-// show list of default, predefined wakelocks
-static ssize_t wakelock_blocker_default_show(struct device *dev, struct device_attribute *attr,
-			    char *buf)
+static ssize_t wakelock_blocker_show(struct device *dev,
+				     struct device_attribute *attr, char *buf)
 {
-	// return list of wakelocks to be blocked
-	return sprintf(buf, "%s\n", list_wl_default);
+	unsigned long flags;
+	ssize_t ret;
+
+	spin_lock_irqsave(&wl_blocker_lock, flags);
+	ret = sysfs_emit(buf, "%s\n", list_wl);
+	spin_unlock_irqrestore(&wl_blocker_lock, flags);
+	return ret;
 }
 
-
-// store list of default, predefined wakelocks
-static ssize_t wakelock_blocker_default_store(struct device * dev, struct device_attribute *attr,
-			     const char * buf, size_t n)
+static ssize_t wakelock_blocker_store(struct device *dev,
+				      struct device_attribute *attr,
+				      const char *buf, size_t count)
 {
-	int len = n;
+	unsigned long flags;
+	int ret;
 
-	// check if string is too long to be stored
-	if (len > LENGTH_LIST_WL_DEFAULT)
-		return -EINVAL;
+	spin_lock_irqsave(&wl_blocker_lock, flags);
+	ret = copy_sysfs_value(list_wl, sizeof(list_wl), buf, count);
+	if (!ret)
+		build_search_string_locked();
+	spin_unlock_irqrestore(&wl_blocker_lock, flags);
 
-	// store default, predefined wakelock list and rebuild search string
-	sscanf(buf, "%s", list_wl_default);
-	build_search_string(list_wl_default, list_wl);
-
-	return n;
+	return ret ? ret : count;
 }
 
-
-// show debug information of driver internals
-static ssize_t debug_show(struct device *dev, struct device_attribute *attr, char *buf)
+static ssize_t wakelock_blocker_default_show(struct device *dev,
+					     struct device_attribute *attr,
+					     char *buf)
 {
-	// return current debug status
-	return sprintf(buf, "Debug status: %d\n\nUser list: %s\nDefault list: %s\nSearch list: %s\nActive: %d\n",
-					wl_blocker_debug, list_wl, list_wl_default, list_wl_search, wl_blocker_active);
+	unsigned long flags;
+	ssize_t ret;
+
+	spin_lock_irqsave(&wl_blocker_lock, flags);
+	ret = sysfs_emit(buf, "%s\n", list_wl_default);
+	spin_unlock_irqrestore(&wl_blocker_lock, flags);
+	return ret;
 }
 
+static ssize_t wakelock_blocker_default_store(struct device *dev,
+					      struct device_attribute *attr,
+					      const char *buf, size_t count)
+{
+	unsigned long flags;
+	int ret;
 
-// store debug mode on/off (1/0)
+	spin_lock_irqsave(&wl_blocker_lock, flags);
+	ret = copy_sysfs_value(list_wl_default, sizeof(list_wl_default),
+			       buf, count);
+	if (!ret)
+		build_search_string_locked();
+	spin_unlock_irqrestore(&wl_blocker_lock, flags);
+
+	return ret ? ret : count;
+}
+
+static ssize_t debug_show(struct device *dev, struct device_attribute *attr,
+			  char *buf)
+{
+	unsigned long flags;
+	ssize_t ret;
+
+	spin_lock_irqsave(&wl_blocker_lock, flags);
+	ret = sysfs_emit(buf,
+			 "Debug status: %d\nUser list: %s\nDefault list: %s\nActive: %d\n",
+			 wl_blocker_debug, list_wl, list_wl_default,
+			 wl_blocker_active);
+	spin_unlock_irqrestore(&wl_blocker_lock, flags);
+	return ret;
+}
+
 static ssize_t debug_store(struct device *dev, struct device_attribute *attr,
-						const char *buf, size_t count)
+			   const char *buf, size_t count)
 {
-	unsigned int ret = -EINVAL;
-	unsigned int val;
+	unsigned long flags;
+	bool value;
+	int ret;
 
-	// check data and store if valid
-	ret = sscanf(buf, "%d", &val);
+	ret = kstrtobool(buf, &value);
+	if (ret)
+		return ret;
 
-	if (ret != 1)
-		return -EINVAL;
-
-	if (val == 1)
-		wl_blocker_debug = true;
-	else
-		wl_blocker_debug = false;
-
+	spin_lock_irqsave(&wl_blocker_lock, flags);
+	wl_blocker_debug = value;
+	spin_unlock_irqrestore(&wl_blocker_lock, flags);
 	return count;
 }
 
-
-static ssize_t version_show(struct device *dev, struct device_attribute *attr, char *buf)
+static ssize_t version_show(struct device *dev, struct device_attribute *attr,
+			    char *buf)
 {
-	// return version information
-	return sprintf(buf, "%s\n", BOEFFLA_WL_BLOCKER_VERSION);
+	return sysfs_emit(buf, "%s\n", BOEFFLA_WL_BLOCKER_VERSION);
 }
 
+static DEVICE_ATTR(wakelock_blocker, 0644, wakelock_blocker_show,
+		   wakelock_blocker_store);
+static DEVICE_ATTR(wakelock_blocker_default, 0644,
+		   wakelock_blocker_default_show,
+		   wakelock_blocker_default_store);
+static DEVICE_ATTR(debug, 0644, debug_show, debug_store);
+static DEVICE_ATTR(version, 0444, version_show, NULL);
 
-
-/*****************************************/
-// Initialize sysfs objects
-/*****************************************/
-
-// define objects
-static DEVICE_ATTR(wakelock_blocker, 0644, wakelock_blocker_show, wakelock_blocker_store);
-static DEVICE_ATTR(wakelock_blocker_default, 0644, wakelock_blocker_default_show, wakelock_blocker_default_store);
-static DEVICE_ATTR(debug, 0664, debug_show, debug_store);
-static DEVICE_ATTR(version, 0664, version_show, NULL);
-
-// define attributes
 static struct attribute *boeffla_wl_blocker_attributes[] = {
 	&dev_attr_wakelock_blocker.attr,
 	&dev_attr_wakelock_blocker_default.attr,
 	&dev_attr_debug.attr,
 	&dev_attr_version.attr,
-	NULL
+	NULL,
 };
 
-// define attribute group
-static struct attribute_group boeffla_wl_blocker_control_group = {
+static const struct attribute_group boeffla_wl_blocker_control_group = {
 	.attrs = boeffla_wl_blocker_attributes,
 };
 
-// define control device
 static struct miscdevice boeffla_wl_blocker_control_device = {
 	.minor = MISC_DYNAMIC_MINOR,
 	.name = "boeffla_wakelock_blocker",
 };
 
-
-/*****************************************/
-// Driver init and exit functions
-/*****************************************/
-
-static int boeffla_wl_blocker_init(void)
+static int __init boeffla_wl_blocker_init(void)
 {
-	// register boeffla wakelock blocker control device
-	misc_register(&boeffla_wl_blocker_control_device);
-	if (sysfs_create_group(&boeffla_wl_blocker_control_device.this_device->kobj,
-				&boeffla_wl_blocker_control_group) < 0) {
-		printk("Boeffla WL blocker: failed to create sys fs object.\n");
-		return 0;
+	unsigned long flags;
+	int ret;
+
+	spin_lock_irqsave(&wl_blocker_lock, flags);
+	strscpy(list_wl_default, LIST_WL_DEFAULT, sizeof(list_wl_default));
+	build_search_string_locked();
+	spin_unlock_irqrestore(&wl_blocker_lock, flags);
+
+	ret = misc_register(&boeffla_wl_blocker_control_device);
+	if (ret) {
+		pr_err("Boeffla WL blocker: misc registration failed: %d\n",
+		       ret);
+		return ret;
 	}
 
-	// initialize default list
-	sprintf(list_wl_default, "%s", LIST_WL_DEFAULT);
-	build_search_string(list_wl_default, list_wl);
+	ret = sysfs_create_group(
+		&boeffla_wl_blocker_control_device.this_device->kobj,
+		&boeffla_wl_blocker_control_group);
+	if (ret) {
+		pr_err("Boeffla WL blocker: sysfs setup failed: %d\n", ret);
+		misc_deregister(&boeffla_wl_blocker_control_device);
+		return ret;
+	}
 
-	// Print debug info
-	printk("Boeffla WL blocker: driver version %s started\n", BOEFFLA_WL_BLOCKER_VERSION);
-
+	pr_info("Boeffla WL blocker: driver version %s started\n",
+		BOEFFLA_WL_BLOCKER_VERSION);
 	return 0;
 }
 
-
-static void boeffla_wl_blocker_exit(void)
+static void __exit boeffla_wl_blocker_exit(void)
 {
-	// remove boeffla wakelock blocker control device
-	sysfs_remove_group(&boeffla_wl_blocker_control_device.this_device->kobj,
-                           &boeffla_wl_blocker_control_group);
-
-	// Print debug info
-	printk("Boeffla WL blocker: driver stopped\n");
+	sysfs_remove_group(
+		&boeffla_wl_blocker_control_device.this_device->kobj,
+		&boeffla_wl_blocker_control_group);
+	misc_deregister(&boeffla_wl_blocker_control_device);
+	pr_info("Boeffla WL blocker: driver stopped\n");
 }
 
-
-/* define driver entry points */
 module_init(boeffla_wl_blocker_init);
 module_exit(boeffla_wl_blocker_exit);
+
+MODULE_DESCRIPTION("Boeffla wakelock blocker");
+MODULE_LICENSE("GPL v2");
