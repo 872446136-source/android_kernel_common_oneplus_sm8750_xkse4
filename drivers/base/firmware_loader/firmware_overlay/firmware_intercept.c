@@ -43,6 +43,7 @@ enum intercept_status intercept_firmware_load(struct firmware *fw,
 {
 	const struct overlay_file *ov = find_overlay(name);
 	void *decompressed_data, *workspace;
+	bool loader_allocated = false;
 	size_t decompressed_size, workspace_size;
 	struct fw_priv *fw_priv;
 	zstd_dctx *dctx;
@@ -53,8 +54,6 @@ enum intercept_status intercept_firmware_load(struct firmware *fw,
 		return INTERCEPT_STATUS_ERROR;
 
 	fw_priv = fw->priv;
-	if (fw_priv->data)
-		return INTERCEPT_STATUS_ERROR;
 
 	workspace_size = zstd_dctx_workspace_bound();
 	workspace = vzalloc(workspace_size);
@@ -67,10 +66,21 @@ enum intercept_status intercept_firmware_load(struct firmware *fw,
 		return INTERCEPT_STATUS_ERROR;
 	}
 
-	decompressed_data = vmalloc(ov->orig_size);
-	if (!decompressed_data) {
-		vfree(workspace);
-		return INTERCEPT_STATUS_ERROR;
+	if (fw_priv->data) {
+		if (fw_priv->allocated_size < ov->orig_size) {
+			pr_err("firmware_overlay: caller buffer for %s is too small: %zu < %zu\n",
+			       name, fw_priv->allocated_size, ov->orig_size);
+			vfree(workspace);
+			return INTERCEPT_STATUS_ERROR;
+		}
+		decompressed_data = fw_priv->data;
+	} else {
+		decompressed_data = vmalloc(ov->orig_size);
+		if (!decompressed_data) {
+			vfree(workspace);
+			return INTERCEPT_STATUS_ERROR;
+		}
+		loader_allocated = true;
 	}
 
 	decompressed_size = zstd_decompress_dctx(dctx, decompressed_data,
@@ -80,14 +90,17 @@ enum intercept_status intercept_firmware_load(struct firmware *fw,
 	if (zstd_is_error(decompressed_size) ||
 	    decompressed_size != ov->orig_size) {
 		pr_err("firmware_overlay: failed to decompress %s\n", name);
-		vfree(decompressed_data);
+		if (loader_allocated)
+			vfree(decompressed_data);
 		return INTERCEPT_STATUS_ERROR;
 	}
 
-	fw_priv->data = decompressed_data;
+	if (loader_allocated) {
+		fw_priv->data = decompressed_data;
+		/* A zero allocated_size marks data as loader-owned for release. */
+		fw_priv->allocated_size = 0;
+	}
 	fw_priv->size = decompressed_size;
-	/* A zero allocated_size marks data as loader-owned for release. */
-	fw_priv->allocated_size = 0;
 #ifdef CONFIG_FW_LOADER_PAGED_BUF
 	fw_priv->is_paged_buf = false;
 #endif

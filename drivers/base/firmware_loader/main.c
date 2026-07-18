@@ -984,11 +984,21 @@ _request_firmware(const struct firmware **firmware_p, const char *name,
 	old_cred = override_creds(kern_cred);
 
 #ifdef CONFIG_REGDB_FIRMWARE_OVERLAY
-	if (!(opt_flags & FW_OPT_PARTIAL) && should_intercept_firmware(name) &&
-	    intercept_firmware_load(fw, name) == INTERCEPT_STATUS_SUCCESS) {
-		fw_state_done(fw->priv);
-		ret = assign_fw(fw, device);
-		goto out_revert_creds;
+	if (!(opt_flags & FW_OPT_PARTIAL) && should_intercept_firmware(name)) {
+		enum intercept_status status;
+
+		status = intercept_firmware_load(fw, name);
+		if (status == INTERCEPT_STATUS_SUCCESS) {
+			fw_state_done(fw->priv);
+			ret = assign_fw(fw, device);
+			goto out_revert_creds;
+		}
+		if (status == INTERCEPT_STATUS_ERROR) {
+			dev_err(device, "Embedded firmware overlay for %s failed\n",
+				name);
+			ret = -EINVAL;
+			goto out_revert_creds;
+		}
 	}
 #endif
 
