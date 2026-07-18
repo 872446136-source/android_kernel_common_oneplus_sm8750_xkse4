@@ -916,6 +916,8 @@ static ssize_t writeback_store(struct device *dev,
 	batch_max = min_t(unsigned long, batch_max, nr_pages);
 	end_index = index + nr_pages;
 
+	/* Keep batch selection and writeback-limit accounting per-device. */
+	mutex_lock(&zram->writeback_lock);
 	down_read(&zram->init_lock);
 	if (!init_done(zram)) {
 		ret = -EINVAL;
@@ -1001,6 +1003,7 @@ free_pages:
 		__free_page(pages[i]);
 release_init_lock:
 	up_read(&zram->init_lock);
+	mutex_unlock(&zram->writeback_lock);
 	return ret;
 }
 
@@ -2532,6 +2535,7 @@ static int zram_add(void)
 
 	init_rwsem(&zram->init_lock);
 #ifdef CONFIG_ZRAM_WRITEBACK
+	mutex_init(&zram->writeback_lock);
 	spin_lock_init(&zram->wb_limit_lock);
 	spin_lock_init(&zram->bitmap_lock);
 	zram->wb_next_block = 1;
