@@ -32,15 +32,30 @@ mapfile -d '' modules < <(
 
 table_file="$tmp_dir/table"
 : > "$table_file"
+declare -A used_module_names=()
 count=0
 
 for module in "${modules[@]}"; do
 	base="$(basename "$module")"
 	name="${base%.payload}"
+	if [[ ! "$name" =~ ^[a-zA-Z0-9_-]+$ ]]; then
+		echo "module_overlay: invalid module payload name: $base" >&2
+		exit 1
+	fi
 	name="${name//-/_}"
-	array_name="$(printf '%s' "$name" | sed 's/[^a-zA-Z0-9_]/_/g')_zstd"
+	if [[ -n "${used_module_names[$name]+set}" ]]; then
+		echo "module_overlay: duplicate normalized module name: $name" >&2
+		exit 1
+	fi
+	used_module_names["$name"]=1
+
+	array_name="module_${name}_zstd"
 	compressed="$tmp_dir/$base.zst"
 	original_size="$(stat -c '%s' "$module")"
+	if (( original_size == 0 )); then
+		echo "module_overlay: refusing empty payload: $module" >&2
+		exit 1
+	fi
 
 	zstd -22 -q -f "$module" -o "$compressed"
 

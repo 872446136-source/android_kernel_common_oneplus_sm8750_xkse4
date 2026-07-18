@@ -43,9 +43,13 @@ count=0
 
 for bin in "${bin_files[@]}"; do
 	base="$(basename "$bin")"
+	if [[ ! "$base" =~ ^[a-zA-Z0-9_.-]+\.bin$ ]]; then
+		echo "firmware_overlay: invalid firmware payload name: $base" >&2
+		exit 1
+	fi
 	safe_name="${base%.bin}"
 	safe_name="$(printf '%s' "$safe_name" | sed 's/[^a-zA-Z0-9_]/_/g')"
-	array_name="${safe_name}_data"
+	array_name="firmware_${safe_name}_data"
 
 	if [[ -n "${used_array_names[$array_name]+set}" ]]; then
 		echo "firmware_overlay: duplicate generated name: $array_name" >&2
