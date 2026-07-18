@@ -48,6 +48,13 @@ module_overlay_replace(struct load_info *info, const char *name)
 	if (!overlay)
 		return MODULE_OVERLAY_SKIP;
 
+	ret = security_kernel_load_data(LOADING_MODULE, true);
+	if (ret) {
+		pr_err("module_overlay: security policy rejected %s: %d\n",
+		       name, ret);
+		return MODULE_OVERLAY_ERROR;
+	}
+
 	workspace_size = zstd_dctx_workspace_bound();
 	workspace = vzalloc(workspace_size);
 	if (!workspace)
