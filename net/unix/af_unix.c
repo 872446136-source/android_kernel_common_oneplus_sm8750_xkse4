@@ -717,7 +717,8 @@ static void unix_release_sock(struct sock *sk, int embrion)
 	 *	  What the above comment does talk about? --ANK(980817)
 	 */
 
-	unix_schedule_gc(NULL);
+	if (READ_ONCE(unix_tot_inflight))
+		unix_gc();		/* Garbage collect fds */
 }
 
 static void init_peercred(struct sock *sk)
@@ -1677,7 +1678,7 @@ restart:
 	__skb_queue_tail(&other->sk_receive_queue, skb);
 	spin_unlock(&other->sk_receive_queue.lock);
 	unix_state_unlock(other);
-	other->sk_data_ready(other);
+	READ_ONCE(other->sk_data_ready)(other);
 	sock_put(other);
 	return 0;
 
@@ -1958,6 +1959,7 @@ static int unix_dgram_sendmsg(struct socket *sock, struct msghdr *msg,
 	if (err < 0)
 		return err;
 
+	wait_for_unix_gc(scm.fp);
 
 	err = -EOPNOTSUPP;
 	if (msg->msg_flags&MSG_OOB)
@@ -2136,7 +2138,7 @@ restart_locked:
 	scm_stat_add(other, skb);
 	skb_queue_tail(&other->sk_receive_queue, skb);
 	unix_state_unlock(other);
-	other->sk_data_ready(other);
+	READ_ONCE(other->sk_data_ready)(other);
 	sock_put(other);
 	scm_destroy(&scm);
 	return len;
@@ -2204,7 +2206,7 @@ static int queue_oob(struct socket *sock, struct msghdr *msg, struct sock *other
 
 	sk_send_sigurg(other);
 	unix_state_unlock(other);
-	other->sk_data_ready(other);
+	READ_ONCE(other->sk_data_ready)(other);
 
 	return err;
 }
@@ -2226,6 +2228,7 @@ static int unix_stream_sendmsg(struct socket *sock, struct msghdr *msg,
 	if (err < 0)
 		return err;
 
+	wait_for_unix_gc(scm.fp);
 
 	err = -EOPNOTSUPP;
 	if (msg->msg_flags & MSG_OOB) {
@@ -2314,7 +2317,7 @@ static int unix_stream_sendmsg(struct socket *sock, struct msghdr *msg,
 		scm_stat_add(other, skb);
 		skb_queue_tail(&other->sk_receive_queue, skb);
 		unix_state_unlock(other);
-		other->sk_data_ready(other);
+		READ_ONCE(other->sk_data_ready)(other);
 		sent += size;
 	}
 

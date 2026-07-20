@@ -498,6 +498,9 @@ int kvm_iommu_map_pages(pkvm_handle_t domain_id, unsigned long iova,
 	    iova + size < iova || paddr + size < paddr)
 		return -E2BIG;
 
+	if (!IS_ALIGNED(iova | paddr, pgsize))
+		return -EINVAL;
+
 	if (domain_id == KVM_IOMMU_DOMAIN_IDMAP_ID)
 		return -EINVAL;
 
@@ -600,6 +603,9 @@ size_t kvm_iommu_unmap_pages(pkvm_handle_t domain_id,
 
 	if (__builtin_mul_overflow(pgsize, pgcount, &size) ||
 	    iova + size < iova)
+		return 0;
+
+	if (!IS_ALIGNED(iova, pgsize))
 		return 0;
 
 	if (domain_id == KVM_IOMMU_DOMAIN_IDMAP_ID)
@@ -827,5 +833,30 @@ int kvm_iommu_snapshot_host_stage2(struct kvm_hyp_iommu_domain *domain)
 		kvm_iommu_idmap_init_done();
 	hyp_spin_unlock(&host_mmu.lock);
 
+	return ret;
+}
+
+int kvm_iommu_iotlb_sync_map(pkvm_handle_t domain_id,
+			     unsigned long iova, size_t size)
+{
+	struct kvm_hyp_iommu_domain *domain;
+	int ret;
+
+	if (!kvm_iommu_ops || !kvm_iommu_ops->iotlb_sync_map)
+		return -ENODEV;
+
+	if (!size || (iova + size < iova))
+		return -EINVAL;
+
+	if (domain_id == KVM_IOMMU_DOMAIN_IDMAP_ID)
+		return -EINVAL;
+
+	domain = handle_to_domain(domain_id);
+
+	if (!domain || domain_get(domain))
+		return -EINVAL;
+
+	ret = kvm_iommu_ops->iotlb_sync_map(domain, iova, size);
+	domain_put(domain);
 	return ret;
 }

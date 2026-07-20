@@ -252,6 +252,7 @@ void __filemap_remove_folio(struct folio *folio, void *shadow)
 	filemap_unaccount_folio(mapping, folio);
 	page_cache_delete(mapping, folio, shadow);
 }
+EXPORT_SYMBOL(__filemap_remove_folio);
 
 void filemap_free_folio(struct address_space *mapping, struct folio *folio)
 {
@@ -1015,6 +1016,7 @@ int filemap_add_folio(struct address_space *mapping, struct folio *folio,
 				return ret;
 			}
 		}
+		trace_android_vh_filemap_adjust_folio_flags(mapping, folio, index);
 		folio_add_lru(folio);
 	}
 	return ret;
@@ -1700,6 +1702,7 @@ void folio_end_writeback(struct folio *folio)
 		BUG();
 
 	smp_mb__after_atomic();
+	trace_android_vh_folio_end_writeback(folio);
 	folio_wake(folio, PG_writeback);
 	acct_reclaim_writeback(folio);
 	folio_put(folio);
@@ -2059,6 +2062,7 @@ no_page:
 
 	if (!folio)
 		return ERR_PTR(-ENOENT);
+	trace_android_vh_filemap_get_folio_end(mapping, folio);
 	return folio;
 }
 EXPORT_SYMBOL(__filemap_get_folio);
@@ -3289,6 +3293,11 @@ static struct file *do_sync_mmap_readahead(struct vm_fault *vmf)
 	unsigned long vm_flags = vmf->vma->vm_flags;
 	unsigned int mmap_miss;
 	unsigned int readaround_pages;
+	bool skip = false;
+
+	trace_android_vh_do_sync_mmap_readahead(vmf, &skip);
+	if (skip)
+		return fpin;
 
 #ifdef CONFIG_TRANSPARENT_HUGEPAGE
 	/* Use the readahead code, even if readahead is disabled */
@@ -3506,6 +3515,8 @@ retry_find:
 		goto page_not_uptodate;
 	}
 
+	trace_android_vh_filemap_fault_post_folio_locked(inode, folio, index);
+
 	/*
 	 * We've made it this far and we had to drop our mmap_lock, now is the
 	 * time to return to the upper layer and have it re-find the vma and
@@ -3721,6 +3732,7 @@ static vm_fault_t filemap_map_order0_folio(struct vm_fault *vmf,
 
 	set_pte_range(vmf, folio, page, 1, addr);
 	folio_ref_inc(folio);
+	trace_android_vh_map_order0_folio(vmf->vma->vm_file, vmf->pgoff, folio, ret);
 
 	return ret;
 }
@@ -3731,7 +3743,7 @@ vm_fault_t filemap_map_pages(struct vm_fault *vmf,
 	struct vm_area_struct *vma = vmf->vma;
 	struct file *file = vma->vm_file;
 	struct address_space *mapping = file->f_mapping;
-	pgoff_t last_pgoff = start_pgoff;
+	pgoff_t file_end, last_pgoff = start_pgoff;
 	unsigned long addr;
 	XA_STATE(xas, &mapping->i_pages, start_pgoff);
 	struct folio *folio;
@@ -3739,6 +3751,15 @@ vm_fault_t filemap_map_pages(struct vm_fault *vmf,
 	unsigned int nr_pages = 0, mmap_miss = 0, mmap_miss_saved;
 	pgoff_t first_pgoff = 0;
 	pgoff_t orig_start_pgoff = start_pgoff;
+	bool can_map_large;
+
+	/*
+	 * Recalculate end_pgoff based on file_end before calling
+	 * next_uptodate_folio() to avoid races with concurrent
+	 * truncation.
+	 */
+	file_end = DIV_ROUND_UP(i_size_read(mapping->host), PAGE_SIZE) - 1;
+	end_pgoff = min(end_pgoff, file_end);
 
 	rcu_read_lock();
 	folio = next_uptodate_folio(&xas, mapping, end_pgoff);
@@ -3747,7 +3768,17 @@ vm_fault_t filemap_map_pages(struct vm_fault *vmf,
 	first_pgoff = xas.xa_index;
 	orig_start_pgoff = xas.xa_index;
 
-	if (filemap_map_pmd(vmf, folio, start_pgoff)) {
+	/*
+	 * Do not allow to map with PTEs beyond i_size and with PMD
+	 * across i_size to preserve SIGBUS semantics.
+	 *
+	 * Make an exception for shmem/tmpfs that for long time
+	 * intentionally mapped with PMDs across i_size.
+	 */
+	can_map_large = shmem_mapping(mapping) ||
+		file_end >= folio_next_index(folio);
+
+	if (can_map_large && filemap_map_pmd(vmf, folio, start_pgoff)) {
 		ret = VM_FAULT_NOPAGE;
 		goto out;
 	}
@@ -3759,6 +3790,7 @@ vm_fault_t filemap_map_pages(struct vm_fault *vmf,
 		folio_put(folio);
 		goto out;
 	}
+
 	do {
 		unsigned long end;
 
@@ -3847,7 +3879,7 @@ int generic_file_mmap(struct file *file, struct vm_area_struct *vma)
  */
 int generic_file_readonly_mmap(struct file *file, struct vm_area_struct *vma)
 {
-	if ((vma->vm_flags & VM_SHARED) && (vma->vm_flags & VM_MAYWRITE))
+	if (vma_is_shared_maywrite(vma))
 		return -EINVAL;
 	return generic_file_mmap(file, vma);
 }
