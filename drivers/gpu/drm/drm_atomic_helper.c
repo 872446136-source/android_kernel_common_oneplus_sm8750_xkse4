@@ -581,10 +581,9 @@ static int drm_atomic_check_valid_clones(struct drm_atomic_state *state,
 									  crtc);
 
 	drm_for_each_encoder_mask(drm_enc, crtc->dev, crtc_state->encoder_mask) {
-		if (!drm_enc->possible_clones) {
-			DRM_DEBUG("enc%d possible_clones is 0\n", drm_enc->base.id);
+		if (!(crtc->dev->mode_config.encoder_clones_explicit &
+		      drm_encoder_mask(drm_enc)))
 			continue;
-		}
 
 		if ((crtc_state->encoder_mask & drm_enc->possible_clones) !=
 		    crtc_state->encoder_mask) {

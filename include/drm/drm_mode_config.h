@@ -480,6 +480,17 @@ struct drm_mode_config {
 	 * lifetime of a device and hence doesn't need any locks.
 	 */
 	int num_encoder;
+#ifndef __GENKSYMS__ /* Placed in an existing hole in the structure. */
+	/**
+	 * @encoder_clones_explicit:
+	 *
+	 * Bitmask of encoders for which the driver explicitly initialized
+	 * &drm_encoder.possible_clones before mode-config validation. Encoders
+	 * without a bit set predate generic clone validation and remain subject
+	 * to the driver's atomic checks.
+	 */
+	u32 encoder_clones_explicit;
+#endif
 	/**
 	 * @encoder_list:
 	 *
