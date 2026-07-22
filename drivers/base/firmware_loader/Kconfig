@@ -42,6 +42,7 @@ if FW_LOADER
 config REGDB_FIRMWARE_OVERLAY
 	bool "Embed an optional Wi-Fi regdb replacement"
 	depends on FW_LOADER=y
+	default n
 	select ZSTD_DECOMPRESS
 	help
 	  Embed regdb.bin and return it for full firmware requests with the same

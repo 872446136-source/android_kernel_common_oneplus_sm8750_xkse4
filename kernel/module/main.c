@@ -59,7 +59,9 @@
 #include <linux/debugfs.h>
 #include <uapi/linux/module.h>
 #include "internal.h"
+#ifdef CONFIG_MODULE_OVERLAY
 #include "module_overlay/overlay_files.h"
+#endif
 
 #define CREATE_TRACE_POINTS
 #include <trace/events/module.h>
@@ -2919,10 +2921,8 @@ static int load_module(struct load_info *info, const char __user *uargs,
 	if (err)
 		goto free_copy;
 
-	/*
-	 * Replace only when an embedded module with the same requested name
-	 * exists. An empty overlay table leaves normal module loading intact.
-	 */
+#ifdef CONFIG_MODULE_OVERLAY
+	/* Replace only if an embedded module has the same requested name. */
 	if ((flags & MODULE_INIT_COMPRESSED_FILE) &&
 	    module_overlay_has(info->name)) {
 		/*
@@ -2962,6 +2962,7 @@ static int load_module(struct load_info *info, const char __user *uargs,
 			}
 		}
 	}
+#endif
 
 	err = early_mod_check(info, flags);
 	if (err)

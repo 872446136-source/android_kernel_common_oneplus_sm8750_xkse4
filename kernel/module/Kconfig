@@ -22,6 +22,18 @@ menuconfig MODULES
 
 if MODULES
 
+config MODULE_OVERLAY
+	bool "Embed optional module replacement payloads"
+	default n
+	select ZSTD_DECOMPRESS
+	help
+	  Embed Zstd-compressed module replacement payloads into the kernel.
+	  When a module with a matching normalized name is loaded, the embedded
+	  image is substituted before the normal module validation and loading
+	  path continues.
+
+	  If unsure, say N.
+
 config MODULE_DEBUGFS
 	bool
 
