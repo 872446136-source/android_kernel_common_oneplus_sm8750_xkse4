@@ -130,6 +130,7 @@ struct scan_control {
 
 	/* Proactive reclaim invoked by userspace through memory.reclaim */
 	unsigned int proactive:1;
+	unsigned int anon_only:1;
 
 	/*
 	 * Cgroup memory below memory.low is protected as long as we
@@ -3268,6 +3269,18 @@ static void get_scan_count(struct lruvec *lruvec, struct scan_control *sc,
 	enum lru_list lru;
 	bool balance_anon_file_reclaim = false;
 
+	/* Userspace-requested proactive reclaim of anonymous memory only. */
+	if (sc->anon_only) {
+		WARN_ON_ONCE(!sc->proactive);
+		if (!can_reclaim_anon_pages(memcg, pgdat->node_id, sc)) {
+			memset(nr, 0, sizeof(*nr) * NR_LRU_LISTS);
+			return;
+		}
+
+		scan_balance = SCAN_ANON;
+		goto out;
+	}
+
 	/* If we have no swap space, do not bother scanning anon folios. */
 	if (!sc->may_swap || !can_reclaim_anon_pages(memcg, pgdat->node_id, sc)) {
 		scan_balance = SCAN_FILE;
@@ -3661,6 +3674,11 @@ static int get_swappiness(struct lruvec *lruvec, struct scan_control *sc)
 	int swappiness;
 	struct mem_cgroup *memcg = lruvec_memcg(lruvec);
 	struct pglist_data *pgdat = lruvec_pgdat(lruvec);
+
+	if (sc->anon_only) {
+		WARN_ON_ONCE(!sc->proactive);
+		return MAX_SWAPPINESS;
+	}
 
 	if (!sc->may_swap)
 		return 0;
@@ -4941,14 +4959,23 @@ static void set_initial_priority(struct pglist_data *pgdat, struct scan_control 
 static bool lruvec_is_sizable(struct lruvec *lruvec, struct scan_control *sc)
 {
 	int gen, type, zone;
+	int first_type, last_type;
 	unsigned long total = 0;
 	bool can_swap = get_swappiness(lruvec, sc);
 	struct lru_gen_folio *lrugen = &lruvec->lrugen;
 	struct mem_cgroup *memcg = lruvec_memcg(lruvec);
+	struct pglist_data *pgdat = lruvec_pgdat(lruvec);
 	DEFINE_MAX_SEQ(lruvec);
 	DEFINE_MIN_SEQ(lruvec);
 
-	for (type = !can_swap; type < ANON_AND_FILE; type++) {
+	if (sc->anon_only &&
+	    !can_reclaim_anon_pages(memcg, pgdat->node_id, sc))
+		return false;
+
+	first_type = sc->anon_only ? LRU_GEN_ANON : !can_swap;
+	last_type = sc->anon_only ? LRU_GEN_ANON : LRU_GEN_FILE;
+
+	for (type = first_type; type <= last_type; type++) {
 		unsigned long seq;
 
 		for (seq = min_seq[type]; seq <= max_seq; seq++) {
@@ -5543,7 +5570,9 @@ static int isolate_folios(struct lruvec *lruvec, struct scan_control *sc, int sw
 	 * available from the same generation, interpret swappiness 1 as file
 	 * first and 200 as anon first.
 	 */
-	if (!swappiness)
+	if (sc->anon_only)
+		type = LRU_GEN_ANON;
+	else if (!swappiness)
 		type = LRU_GEN_FILE;
 	else if (sc->clean_below_min)
 		type = LRU_GEN_ANON;
@@ -5567,6 +5596,8 @@ static int isolate_folios(struct lruvec *lruvec, struct scan_control *sc, int sw
 
 		scanned = scan_folios(lruvec, sc, type, tier, list);
 		if (scanned)
+			break;
+		if (sc->anon_only)
 			break;
 
 		type = !type;
@@ -5683,6 +5714,8 @@ static bool should_run_aging(struct lruvec *lruvec, unsigned long max_seq,
 			     struct scan_control *sc, bool can_swap, unsigned long *nr_to_scan)
 {
 	int gen, type, zone;
+	int first_type = sc->anon_only ? LRU_GEN_ANON : !can_swap;
+	int last_type = sc->anon_only ? LRU_GEN_ANON : LRU_GEN_FILE;
 	unsigned long old = 0;
 	unsigned long young = 0;
 	unsigned long total = 0;
@@ -5691,12 +5724,12 @@ static bool should_run_aging(struct lruvec *lruvec, unsigned long max_seq,
 	DEFINE_MIN_SEQ(lruvec);
 
 	/* whether this lruvec is completely out of cold folios */
-	if (min_seq[!can_swap] + MIN_NR_GENS > max_seq) {
+	if (min_seq[first_type] + MIN_NR_GENS > max_seq) {
 		*nr_to_scan = 0;
 		return true;
 	}
 
-	for (type = !can_swap; type < ANON_AND_FILE; type++) {
+	for (type = first_type; type <= last_type; type++) {
 		unsigned long seq;
 
 		for (seq = min_seq[type]; seq <= max_seq; seq++) {
@@ -5728,7 +5761,7 @@ static bool should_run_aging(struct lruvec *lruvec, unsigned long max_seq,
 	 * stalls when the number of generations reaches MIN_NR_GENS. Hence, the
 	 * ideal number of generations is MIN_NR_GENS+1.
 	 */
-	if (min_seq[!can_swap] + MIN_NR_GENS < max_seq)
+	if (min_seq[first_type] + MIN_NR_GENS < max_seq)
 		return false;
 
 	/*
@@ -5755,10 +5788,17 @@ static long get_nr_to_scan(struct lruvec *lruvec, struct scan_control *sc, bool 
 {
 	unsigned long nr_to_scan;
 	struct mem_cgroup *memcg = lruvec_memcg(lruvec);
+	struct pglist_data *pgdat = lruvec_pgdat(lruvec);
 	DEFINE_MAX_SEQ(lruvec);
 
 	if (mem_cgroup_below_min(sc->target_mem_cgroup, memcg))
 		return -1;
+
+	if (sc->anon_only &&
+	    !can_reclaim_anon_pages(memcg, pgdat->node_id, sc)) {
+		WARN_ON_ONCE(!sc->proactive);
+		return 0;
+	}
 
 	if (!should_run_aging(lruvec, max_seq, sc, can_swap, &nr_to_scan))
 		return nr_to_scan;
@@ -5814,7 +5854,7 @@ static bool try_to_shrink_lruvec(struct lruvec *lruvec, struct scan_control *sc)
 	int swappiness = get_swappiness(lruvec, sc);
 
 	/* clean file folios are more likely to exist */
-	if (swappiness && !(sc->gfp_mask & __GFP_IO))
+	if (swappiness && !sc->anon_only && !(sc->gfp_mask & __GFP_IO))
 		swappiness = 1;
 
 	while (true) {
@@ -7672,6 +7712,7 @@ unsigned long try_to_free_mem_cgroup_pages_with_swappiness(struct mem_cgroup *me
 		.may_unmap = 1,
 		.may_swap = !!(reclaim_options & MEMCG_RECLAIM_MAY_SWAP),
 		.proactive = !!(reclaim_options & MEMCG_RECLAIM_PROACTIVE),
+		.anon_only = !!(reclaim_options & MEMCG_RECLAIM_ANON_ONLY),
 	};
 	/*
 	 * Traverse the ZONELIST_FALLBACK zonelist of the current node to put
