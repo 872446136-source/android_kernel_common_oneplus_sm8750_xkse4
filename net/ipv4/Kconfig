@@ -686,6 +686,19 @@ config TCP_CONG_C2TCP
 	  C2TCP combines a loss-based congestion control law with a
 	  delay-control layer intended for cellular and variable-capacity
 	  links. It is registered as "c2tcp".
+
+config TCP_CONG_ROCCET
+	tristate "ROCCET TCP congestion control"
+	default n
+	help
+	  TCP ROCCET congestion control.
+
+	  Extends CUBIC with RTT growth
+	  and ACK-rate based congestion detection.
+
+	  Designed for cellular and high buffer networks.
+
+	  Registered name: roccet
 	  
 config TCP_CONG_BRUTAL
 	tristate "Brutal TCP congestion control"
