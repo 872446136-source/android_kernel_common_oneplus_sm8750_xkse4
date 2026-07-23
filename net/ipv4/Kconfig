@@ -673,6 +673,15 @@ config TCP_CONG_BBR
 	  and adapts upper and lower bandwidth and inflight bounds using real
 	  loss and shallow-threshold ECN signals. It requires pacing, using either
 	  TCP internal pacing or the fq ("Fair Queue") scheduler.
+
+config TCP_CONG_C2TCP
+	tristate "C2TCP congestion control"
+	default n
+	help
+	  Cellular Controlled Delay TCP congestion control.
+	  C2TCP combines a loss-based congestion control law with a
+	  delay-control layer intended for cellular and variable-capacity
+	  links. It is registered as "c2tcp".
 	  
 config TCP_CONG_BRUTAL
 	tristate "Brutal TCP congestion control"
