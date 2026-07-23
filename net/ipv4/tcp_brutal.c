@@ -1,4 +1,5 @@
 #include <linux/module.h>
+#include <linux/overflow.h>
 #include <linux/version.h>
 #include <net/tcp.h>
 #include <linux/math64.h>
@@ -78,6 +79,7 @@ static struct proto tcp_prot_override __ro_after_init;
 #ifdef _TRANSP_V6_H
 static struct proto tcpv6_prot_override __ro_after_init;
 #endif // _TRANSP_V6_H
+static struct tcp_congestion_ops tcp_brutal_ops;
 
 #ifdef _LINUX_SOCKPTR_H
 static int brutal_set_params(struct sock *sk, sockptr_t optval, unsigned int optlen)
@@ -100,15 +102,24 @@ static int brutal_set_params(struct sock *sk, char __user *optval, unsigned int 
 #endif
 
     // Sanity checks
-    if (params.rate < MIN_PACING_RATE)
-        return -EINVAL;
-    if (params.cwnd_gain < MIN_CWND_GAIN || params.cwnd_gain > MAX_CWND_GAIN)
-        return -EINVAL;
+	if (params.rate < MIN_PACING_RATE)
+		return -EINVAL;
+	if (params.rate > U64_MAX / 100)
+		return -EINVAL;
+	if (params.cwnd_gain < MIN_CWND_GAIN || params.cwnd_gain > MAX_CWND_GAIN)
+		return -EINVAL;
 
-    brutal->rate = params.rate;
-    brutal->cwnd_gain = params.cwnd_gain;
+	sockopt_lock_sock(sk);
+	if (inet_csk(sk)->icsk_ca_ops != &tcp_brutal_ops) {
+		sockopt_release_sock(sk);
+		return -ENOPROTOOPT;
+	}
 
-    return 0;
+	brutal->rate = params.rate;
+	brutal->cwnd_gain = params.cwnd_gain;
+	sockopt_release_sock(sk);
+
+	return 0;
 }
 
 #ifdef _LINUX_SOCKPTR_H
@@ -148,8 +159,8 @@ static void brutal_init(struct sock *sk)
     else if (sk->sk_family == AF_INET6)
         sk->sk_prot = &tcpv6_prot_override;
 #endif // _TRANSP_V6_H
-    else
-        BUG(); // WTF?
+	else
+		WARN_ON_ONCE(1);
 
     tp->snd_ssthresh = TCP_INFINITE_SSTHRESH;
 
@@ -180,20 +191,38 @@ static inline void brutal_tcp_snd_cwnd_set(struct tcp_sock *tp, u32 val)
     tp->snd_cwnd = val;
 }
 
+static u32 brutal_add_u32_sat(u32 a, u32 b)
+{
+	u32 sum;
+
+	return check_add_overflow(a, b, &sum) ? U32_MAX : sum;
+}
+
+static u64 brutal_mul_u64_sat(u64 a, u32 b)
+{
+	u64 product;
+
+	return check_mul_overflow(a, (u64)b, &product) ? U64_MAX : product;
+}
+
 static void brutal_update_rate(struct sock *sk)
 {
     struct tcp_sock *tp = tcp_sk(sk);
     struct brutal *brutal = inet_csk_ca(sk);
 
     u64 sec = tcp_sock_get_sec(tp);
-    u64 min_sec = sec - PKT_INFO_SLOTS;
-    u32 acked = 0, losses = 0;
+	u64 min_sec = sec >= PKT_INFO_SLOTS ? sec - PKT_INFO_SLOTS : 0;
+	u64 acked = 0, losses = 0;
+	u64 total;
     u32 ack_rate; // Scaled by 100 (100=1.00) as kernel doesn't support float
     u64 rate = brutal->rate;
-    u32 cwnd;
+	u64 cwnd;
 
     u32 mss = tp->mss_cache;
     u32 rtt_ms = (tp->srtt_us >> 3) / USEC_PER_MSEC;
+
+	if (WARN_ON_ONCE(!mss))
+		return;
     if (!rtt_ms)
         rtt_ms = 1;
 
@@ -205,11 +234,11 @@ static void brutal_update_rate(struct sock *sk)
             losses += brutal->slots[i].losses;
         }
     }
-    if (acked + losses < MIN_PKT_INFO_SAMPLES)
-        ack_rate = 100;
-    else
-    {
-        ack_rate = acked * 100 / (acked + losses);
+	total = acked + losses;
+	if (total < MIN_PKT_INFO_SAMPLES) {
+		ack_rate = 100;
+	} else {
+		ack_rate = div64_u64(acked * 100, total);
         if (ack_rate < MIN_ACK_RATE_PERCENT)
             ack_rate = MIN_ACK_RATE_PERCENT;
     }
@@ -219,13 +248,13 @@ static void brutal_update_rate(struct sock *sk)
 
     // The order here is chosen carefully to avoid overflow as much as possible
     cwnd = div_u64(rate, MSEC_PER_SEC);
-    cwnd *= rtt_ms;
-    cwnd /= mss;
-    cwnd *= brutal->cwnd_gain;
-    cwnd /= 10;
-    cwnd = max_t(u32, cwnd, MIN_CWND);
+	cwnd = brutal_mul_u64_sat(cwnd, rtt_ms);
+	cwnd = div_u64(cwnd, mss);
+	cwnd = brutal_mul_u64_sat(cwnd, brutal->cwnd_gain);
+	cwnd = div_u64(cwnd, 10);
+	cwnd = max_t(u64, cwnd, MIN_CWND);
 
-    brutal_tcp_snd_cwnd_set(tp, min(cwnd, tp->snd_cwnd_clamp));
+	brutal_tcp_snd_cwnd_set(tp, min_t(u64, cwnd, tp->snd_cwnd_clamp));
 
     WRITE_ONCE(sk->sk_pacing_rate, min_t(u64, rate, READ_ONCE(sk->sk_max_pacing_rate)));
 }
@@ -242,9 +271,9 @@ static void brutal_main(struct sock *sk, const struct rate_sample *rs)
     u64 sec;
     u32 slot;
 
-    // Ignore invalid rate samples
-    if (rs->delivered < 0 || rs->interval_us <= 0)
-        return;
+	// Ignore invalid rate samples
+	if (rs->delivered < 0 || rs->interval_us <= 0 || rs->losses < 0)
+		return;
 
     sec = tcp_sock_get_sec(tp);
     div_u64_rem(sec, PKT_INFO_SLOTS, &slot);
@@ -252,8 +281,12 @@ static void brutal_main(struct sock *sk, const struct rate_sample *rs)
     if (brutal->slots[slot].sec == sec)
     {
         // Current slot, update
-        brutal->slots[slot].acked += rs->acked_sacked;
-        brutal->slots[slot].losses += rs->losses;
+		brutal->slots[slot].acked =
+			brutal_add_u32_sat(brutal->slots[slot].acked,
+					   rs->acked_sacked);
+		brutal->slots[slot].losses =
+			brutal_add_u32_sat(brutal->slots[slot].losses,
+					   rs->losses);
     }
     else
     {
