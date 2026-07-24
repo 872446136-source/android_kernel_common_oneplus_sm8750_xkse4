@@ -228,7 +228,8 @@ static int bpf_tcp_ca_init_member(const struct btf_type *t,
 	moff = __btf_member_bit_offset(t, member) / 8;
 	switch (moff) {
 	case offsetof(struct tcp_congestion_ops, flags):
-		if (utcp_ca->flags & ~TCP_CONG_MASK)
+		if (utcp_ca->flags & ~TCP_CONG_MASK ||
+		    utcp_ca->flags & TCP_CONG_WANTS_LOSS_EVENTS)
 			return -EINVAL;
 		tcp_ca->flags = utcp_ca->flags;
 		return 1;

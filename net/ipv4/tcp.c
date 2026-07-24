@@ -3136,7 +3136,9 @@ int tcp_disconnect(struct sock *sk, int flags)
 	tp->rx_opt.dsack = 0;
 	tp->rx_opt.num_sacks = 0;
 	tp->rcv_ooopack = 0;
-
+	tp->fast_ack_mode = 0;
+	tp->tlp_orig_data_app_limited = 0;
+	tp->ecn_flags &= ~TCP_ECN_ECT_PERMANENT;
 
 	/* Clean up fastopen related fields */
 	req = rcu_dereference_protected(tp->fastopen_rsk,

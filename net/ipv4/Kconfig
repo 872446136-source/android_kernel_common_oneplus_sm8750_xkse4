@@ -664,19 +664,17 @@ config TCP_CONG_CDG
 	    delay gradients." In Networking 2011. Preprint: http://goo.gl/No3vdg
 
 config TCP_CONG_BBR
-	tristate "BBR TCP"
+	tristate "BBRv3 TCP"
 	default n
 	help
 
-	  BBR (Bottleneck Bandwidth and RTT) TCP congestion control aims to
-	  maximize network utilization and minimize queues. It builds an explicit
-	  model of the bottleneck delivery rate and path round-trip propagation
-	  delay. It tolerates packet loss and delay unrelated to congestion. It
-	  can operate over LAN, WAN, cellular, wifi, or cable modem links. It can
-	  coexist with flows that use loss-based congestion control, and can
-	  operate with shallow buffers, deep buffers, bufferbloat, policers, or
-	  AQM schemes that do not provide a delay signal. It requires the fq
-	  ("Fair Queue") pacing packet scheduler.
+	  BBRv3 (Bottleneck Bandwidth and RTT version 3) is Google's
+	  model-based TCP congestion control algorithm. It uses bandwidth,
+	  RTT, loss, and optional shallow-threshold ECN signals to maximize
+	  utilization while keeping queues and retransmit rates low. It can
+	  operate over LAN, WAN, cellular, wifi, or cable modem links and can
+	  coexist with loss-based congestion controls. It requires pacing,
+	  using either TCP internal pacing or the fq ("Fair Queue") qdisc.
 
 config TCP_CONG_C2TCP
 	tristate "C2TCP congestion control"

@@ -238,8 +238,11 @@ void tcp_assign_congestion_control(struct sock *sk)
 void tcp_init_congestion_control(struct sock *sk)
 {
 	struct inet_connection_sock *icsk = inet_csk(sk);
+	struct tcp_sock *tp = tcp_sk(sk);
 
-	tcp_sk(sk)->prior_ssthresh = 0;
+	tp->prior_ssthresh = 0;
+	tp->fast_ack_mode = 0;
+	tp->ecn_flags &= ~TCP_ECN_ECT_PERMANENT;
 	if (icsk->icsk_ca_ops->init)
 		icsk->icsk_ca_ops->init(sk);
 	if (tcp_ca_needs_ecn(sk))

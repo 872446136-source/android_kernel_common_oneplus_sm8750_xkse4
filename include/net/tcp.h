@@ -375,6 +375,8 @@ static inline void tcp_dec_quickack_mode(struct sock *sk)
 #define	TCP_ECN_QUEUE_CWR	2
 #define	TCP_ECN_DEMAND_CWR	4
 #define	TCP_ECN_SEEN		8
+#define	TCP_ECN_LOW		16
+#define	TCP_ECN_ECT_PERMANENT	32
 
 enum tcp_tw_status {
 	TCP_TW_SUCCESS = 0,
@@ -745,6 +747,15 @@ static inline void tcp_fast_path_check(struct sock *sk)
 
 u32 tcp_delack_max(const struct sock *sk);
 
+static inline void tcp_set_ecn_low_from_dst(struct sock *sk,
+					    const struct dst_entry *dst)
+{
+	struct tcp_sock *tp = tcp_sk(sk);
+
+	if (dst_feature(dst, RTAX_FEATURE_ECN_LOW))
+		tp->ecn_flags |= TCP_ECN_LOW;
+}
+
 /* Compute the actual rto_min value */
 static inline u32 tcp_rto_min(struct sock *sk)
 {
@@ -841,6 +852,11 @@ static inline u32 tcp_stamp_us_delta(u64 t1, u64 t0)
 	return max_t(s64, t1 - t0, 0);
 }
 
+static inline u32 tcp_stamp32_us_delta(u32 t1, u32 t0)
+{
+	return max_t(s32, t1 - t0, 0);
+}
+
 static inline u32 tcp_skb_timestamp(const struct sk_buff *skb)
 {
 	return tcp_ns_to_ts(skb->skb_mstamp_ns);
@@ -915,10 +931,34 @@ struct tcp_skb_cb {
 			      unused:11;
 			/* pkts S/ACKed so far upon tx of skb, incl retrans: */
 			__u32 delivered;
+#ifdef __GENKSYMS__
 			/* start of send pipeline phase */
 			u64 first_tx_mstamp;
 			/* when we reached the "delivered" count */
 			u64 delivered_mstamp;
+#else
+			union {
+				u64 __kabi_placeholder_f_tx;
+				struct {
+					/* start of send pipeline phase */
+					u32 first_tx_mstamp;
+#define TCPCB_IN_FLIGHT_BITS 20
+#define TCPCB_IN_FLIGHT_MAX ((1U << TCPCB_IN_FLIGHT_BITS) - 1)
+					/* packets in flight at transmit */
+					u32 in_flight:TCPCB_IN_FLIGHT_BITS,
+					    unused2:12;
+				};
+			};
+			union {
+				u64 __kabi_placeholder_del_mst;
+				struct {
+					/* when we reached the "delivered" count */
+					u32 delivered_mstamp;
+					/* packets lost so far upon tx of skb */
+					u32 lost;
+				};
+			};
+#endif
 		} tx;   /* only used for outgoing skbs */
 		union {
 			struct inet_skb_parm	h4;
@@ -1022,6 +1062,9 @@ enum tcp_ca_event {
 	CA_EVENT_LOSS,		/* loss timeout */
 	CA_EVENT_ECN_NO_CE,	/* ECT set, but not CE marked */
 	CA_EVENT_ECN_IS_CE,	/* received CE marked IP packet */
+#ifndef __GENKSYMS__
+	CA_EVENT_TLP_RECOVERY,	/* a lost segment was repaired by TLP probe */
+#endif
 };
 
 /* Information about inbound ACK, passed to cong_ops->in_ack_event() */
@@ -1044,7 +1087,14 @@ enum tcp_ca_ack_event_flags {
 #define TCP_CONG_NON_RESTRICTED 0x1
 /* Requires ECN/ECT set on all packets */
 #define TCP_CONG_NEEDS_ECN	0x2
-#define TCP_CONG_MASK	(TCP_CONG_NON_RESTRICTED | TCP_CONG_NEEDS_ECN)
+/* Wants notification of CE events (CA_EVENT_ECN_IS_CE, CA_EVENT_ECN_NO_CE). */
+#define TCP_CONG_WANTS_CE_EVENTS	0x4
+/* Wants per-SKB loss and TLP recovery notifications. */
+#define TCP_CONG_WANTS_LOSS_EVENTS	0x8
+#define TCP_CONG_MASK	(TCP_CONG_NON_RESTRICTED | \
+			 TCP_CONG_NEEDS_ECN | \
+			 TCP_CONG_WANTS_CE_EVENTS | \
+			 TCP_CONG_WANTS_LOSS_EVENTS)
 
 union tcp_cc_info;
 
@@ -1079,6 +1129,22 @@ struct rate_sample {
 	bool is_app_limited;	/* is sample from packet with bubble in pipe? */
 	bool is_retrans;	/* is sample from retransmission? */
 	bool is_ack_delayed;	/* is this (likely) a delayed ACK? */
+#ifndef __GENKSYMS__
+	bool is_acking_tlp_retrans_seq;  /* ACKed a TLP retransmit sequence? */
+	bool is_ece;		/* did this ACK have ECN marked? */
+	u32 tx_in_flight;	/* packets in flight at starting timestamp */
+	s32  lost;		/* number of packets lost over interval */
+	u32  prior_lost;	/* tp->lost at "prior_mstamp" */
+#endif
+};
+
+/*
+ * Congestion controls that set TCP_CONG_WANTS_LOSS_EVENTS place this at the
+ * beginning of icsk_ca_priv. This keeps the optional callback out of
+ * tcp_congestion_ops, whose layout is part of the Android KMI.
+ */
+struct tcp_skb_loss_event {
+	void (*skb_marked_lost)(struct sock *sk, const struct sk_buff *skb);
 };
 
 struct tcp_congestion_ops {
@@ -1169,6 +1235,33 @@ static inline char *tcp_ca_get_name_by_key(u32 key, char *buffer)
 }
 #endif
 
+static inline bool tcp_ca_wants_ce_events(const struct sock *sk)
+{
+	const struct inet_connection_sock *icsk = inet_csk(sk);
+
+	return icsk->icsk_ca_ops->flags & (TCP_CONG_NEEDS_ECN |
+					   TCP_CONG_WANTS_CE_EVENTS);
+}
+
+static inline bool tcp_ca_wants_loss_events(const struct sock *sk)
+{
+	return inet_csk(sk)->icsk_ca_ops->flags &
+	       TCP_CONG_WANTS_LOSS_EVENTS;
+}
+
+static inline void tcp_ca_skb_marked_lost(struct sock *sk,
+					  const struct sk_buff *skb)
+{
+	const struct tcp_skb_loss_event *event;
+
+	if (!tcp_ca_wants_loss_events(sk))
+		return;
+
+	event = inet_csk_ca(sk);
+	if (event->skb_marked_lost)
+		event->skb_marked_lost(sk, skb);
+}
+
 static inline bool tcp_ca_needs_ecn(const struct sock *sk)
 {
 	const struct inet_connection_sock *icsk = inet_csk(sk);
@@ -1198,6 +1291,21 @@ void tcp_rate_check_app_limited(struct sock *sk);
 static inline bool tcp_skb_sent_after(u64 t1, u64 t2, u32 seq1, u32 seq2)
 {
 	return t1 > t2 || (t1 == t2 && after(seq1, seq2));
+}
+
+/* If a retransmit failed due to local qdisc congestion or other local issues,
+ * then we may have called tcp_set_skb_tso_segs() to increase the number of
+ * segments in the skb without increasing the tx.in_flight. In all other cases,
+ * the tx.in_flight should be at least as big as the pcount of the sk_buff.  We
+ * do not have the state to know whether a retransmit failed due to local qdisc
+ * congestion or other local issues, so to avoid spurious warnings we consider
+ * that any skb marked lost may have suffered that fate.
+ */
+static inline bool tcp_skb_tx_in_flight_is_suspicious(u32 skb_pcount,
+						      u32 skb_sacked_flags,
+						      u32 tx_in_flight)
+{
+	return (skb_pcount > tx_in_flight) && !(skb_sacked_flags & TCPCB_LOST);
 }
 
 /* These functions determine how the current flow behaves in respect of SACK
