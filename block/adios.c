@@ -418,8 +418,7 @@ static bool lm_update_large_buckets(struct latency_model *model,
 		struct latency_model_params *params,
 		struct latency_bucket_large *buckets,
 		u64 total_weight, bool count_all) {
-	s64 sum_latency = 0;
-	u64 sum_block_size = 0, intercept;
+	u64 sum_latency = 0, sum_block_size = 0, intercept;
 	u64 cumulative_weight = 0, threshold_weight = 0;
 	u64 sum_weight = 0;
 	u8  outlier_threshold_bucket = 0;
