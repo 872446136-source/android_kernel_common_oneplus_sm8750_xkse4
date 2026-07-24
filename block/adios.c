@@ -637,9 +637,9 @@ static void latency_model_update(
 static u8 lm_input_bucket_index(u64 measured, u64 predicted) {
 	u32 bucket_index;
 
-	if (measured < predicted * 2)
+	if (predicted > U64_MAX / 2 || measured < predicted * 2)
 		bucket_index = div_u64((measured * 20), predicted);
-	else if (measured < predicted * 5)
+	else if (predicted > U64_MAX / 5 || measured < predicted * 5)
 		bucket_index = div_u64((measured * 10), predicted) + 20;
 	else
 		bucket_index = div_u64((measured * 3), predicted) + 40;
