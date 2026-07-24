@@ -350,6 +350,7 @@ static bool lm_update_small_buckets(struct latency_model *model,
 	u8  outlier_threshold_bucket = 0;
 	u8  outlier_percentile = LM_OUTLIER_PERCENTILE;
 	u8  reduction;
+	u64 updated_sum;
 
 	if (count_all)
 		outlier_percentile = 100;
@@ -399,7 +400,10 @@ static bool lm_update_small_buckets(struct latency_model *model,
 		return false;
 
 	// Accumulate the average latency into the statistics
-	params->small_sum_delay += sum_latency;
+	if (check_add_overflow(params->small_sum_delay, sum_latency,
+			       &updated_sum))
+		updated_sum = U64_MAX;
+	params->small_sum_delay = updated_sum;
 	params->small_count     += sum_weight;
 
 	return true;
@@ -424,6 +428,7 @@ static bool lm_update_large_buckets(struct latency_model *model,
 	u8  outlier_threshold_bucket = 0;
 	u8  outlier_percentile = LM_OUTLIER_PERCENTILE;
 	u8  reduction;
+	u64 updated_sum;
 
 	if (count_all)
 		outlier_percentile = 100;
@@ -484,7 +489,10 @@ static bool lm_update_large_buckets(struct latency_model *model,
 	else
 		sum_latency = 0;
 
-	params->large_sum_delay += sum_latency;
+	if (check_add_overflow(params->large_sum_delay, sum_latency,
+			       &updated_sum))
+		updated_sum = U64_MAX;
+	params->large_sum_delay = updated_sum;
 	params->large_sum_bsize += sum_block_size;
 
 	return true;
