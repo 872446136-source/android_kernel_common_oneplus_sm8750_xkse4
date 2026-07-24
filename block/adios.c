@@ -1373,8 +1373,8 @@ static struct request *dispatch_from_bq(struct adios_data *ad) {
 	// Refill the batch queues if the back page is empty, dl_tree has work, and
 	// current page is empty or the total ongoing latency is below the threshold
 	if (!bq_page_has_rq(bq_state, !ad->bq_page) &&
-			(!bq_curr_page_has_rq || (!tpl || tpl < div_u64(
-			ad->global_latency_window * ad->bq_refill_below_ratio, 100))) &&
+			(!bq_curr_page_has_rq || (!tpl || tpl < mul_u64_u32_div(
+			ad->global_latency_window, ad->bq_refill_below_ratio, 100))) &&
 			eval_this_adios_state(state, ADIOS_STATE_DL))
 		fill_batch_queues(ad, tpl);
 
