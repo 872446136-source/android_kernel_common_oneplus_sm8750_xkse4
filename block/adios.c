@@ -1896,6 +1896,13 @@ static int sideload_latency_model(
 	return 0;
 }
 
+static void adios_mark_models_unstable(struct adios_data *ad)
+{
+	guard(spinlock_irqsave)(&ad->lock);
+
+	ad->models_stable = false;
+}
+
 // Define sysfs attributes for operation types
 #define SYSFS_OPTYPE_DECL(name, optype) \
 static ssize_t adios_lat_model_##name##_show( \
@@ -1926,6 +1933,8 @@ static ssize_t adios_lat_model_##name##_store( \
 	ret = sideload_latency_model(model, base, slope); \
 	if (ret) \
 		return ret; \
+	if (optype != ADIOS_DISCARD && !base) \
+		adios_mark_models_unstable(ad); \
 	return count; \
 } \
 static ssize_t adios_lat_target_##name##_show( \
@@ -1944,6 +1953,8 @@ static ssize_t adios_lat_target_##name##_store( \
 	ret = sideload_latency_model(&ad->latency_model[optype], 0, 0); \
 	if (ret) \
 		return ret; \
+	if (optype != ADIOS_DISCARD) \
+		adios_mark_models_unstable(ad); \
 	ad->latency_target[optype] = nsec; \
 	return count; \
 } \
@@ -2097,6 +2108,8 @@ static ssize_t adios_reset_lat_model_store(
 			ret = sideload_latency_model(model, 0, 0);
 			if (ret)
 				return ret;
+			if (i == ADIOS_READ || i == ADIOS_WRITE)
+				adios_mark_models_unstable(ad);
 		}
 	} else {
 		// Mode 2: Load initial values for all latency models.
@@ -2116,6 +2129,8 @@ static ssize_t adios_reset_lat_model_store(
 				params[i][0], params[i][1]);
 			if (ret)
 				return ret;
+			if (i != ADIOS_DISCARD && !params[i][0])
+				adios_mark_models_unstable(ad);
 		}
 	}
 	return count;
