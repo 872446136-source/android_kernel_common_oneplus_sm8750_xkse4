@@ -27,6 +27,7 @@
 #include <linux/mm.h>
 #include <linux/btf.h>
 #include <linux/btf_ids.h>
+#include <linux/limits.h>
 #include <linux/module.h>
 #include <linux/math64.h>
 #include <net/tcp.h>
@@ -510,6 +511,9 @@ static int __init cubictcp_register(void)
 	int ret;
 
 	BUILD_BUG_ON(sizeof(struct bictcp) > ICSK_CA_PRIV_SIZE);
+	if (beta < 0 || beta >= BICTCP_BETA_SCALE ||
+	    bic_scale <= 0 || bic_scale > INT_MAX / 10)
+		return -EINVAL;
 
 	/* Precompute a bunch of the scaling factors that are used per-packet
 	 * based on SRTT of 100ms
