@@ -46,6 +46,7 @@
 #include <linux/mm.h>
 #include <linux/btf.h>
 #include <linux/btf_ids.h>
+#include <linux/limits.h>
 #include <linux/math.h>
 #include <linux/math64.h>
 #include <linux/module.h>
@@ -643,6 +644,9 @@ static int __init c2tcp_register(void)
 	int ret;
 
 	BUILD_BUG_ON(sizeof(struct c2tcp_ca) > ICSK_CA_PRIV_SIZE);
+	if (c2tcp_beta < 0 || c2tcp_beta >= C2TCP_BETA_SCALE ||
+	    c2tcp_bic_scale <= 0 || c2tcp_bic_scale > INT_MAX / 10)
+		return -EINVAL;
 
 	c2tcp_beta_scale =
 		8 * (C2TCP_BETA_SCALE + c2tcp_beta) / 3 /
