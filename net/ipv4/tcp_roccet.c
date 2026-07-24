@@ -63,6 +63,7 @@ struct roccet_ca {
 	u32	last_event_us;
 	struct roccet_ack_rate ack_rate;
 	u8	ack_rate_samples;
+	u8	rtt_updated;
 };
 
 static bool fast_convergence __read_mostly = true;
@@ -358,7 +359,8 @@ static void roccettcp_cong_avoid(struct sock *sk, u32 ack, u32 acked)
 	bool valid_rtt;
 
 	roccet_update_ack_rate(ca, now, acked);
-	valid_rtt = roccet_update_srrtt(ca);
+	valid_rtt = ca->rtt_updated;
+	ca->rtt_updated = 0;
 
 	if (valid_rtt) {
 		u32 interval = roccet_eval_interval_us(ca->curr_rtt);
@@ -468,6 +470,8 @@ static void roccettcp_acked(struct sock *sk,
 	struct roccet_ca *ca = inet_csk_ca(sk);
 	u32 delay;
 
+	ca->rtt_updated = 0;
+
 	if (sample->rtt_us <= 0)
 		return;
 
@@ -490,6 +494,8 @@ static void roccettcp_acked(struct sock *sk,
 		ca->last_rtt = ca->curr_rtt;
 		ca->curr_rtt = delay;
 	}
+
+	ca->rtt_updated = roccet_update_srrtt(ca);
 }
 
 static struct tcp_congestion_ops roccet __read_mostly = {
