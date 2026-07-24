@@ -666,7 +666,7 @@ static void latency_model_input(struct adios_data *ad,
 	u8 bucket_index;
 	struct lm_pcpu_buckets *pcpu_b;
 	struct lm_buckets *buckets;
-	u64 current_base;
+	u64 current_base, slope_size;
 	struct latency_model_params *params;
 
 	local_irq_save(flags);
@@ -702,13 +702,15 @@ static void latency_model_input(struct adios_data *ad,
 		}
 
 		bucket_index = lm_input_bucket_index(latency, pred_lat);
+		slope_size = DIV_ROUND_UP_ULL(
+			block_size - LM_BLOCK_SIZE_THRESHOLD, 1024) * 1024;
 
 		write_seqcount_begin(&pcpu_b->seq);
 		buckets->large_bucket[bucket_index].sum_of_weights += weight;
 		buckets->large_bucket[bucket_index].weighted_sum_latency +=
 			latency * weight;
 		buckets->large_bucket[bucket_index].weighted_sum_block_size +=
-			(u64)block_size * weight;
+			slope_size * weight;
 		write_seqcount_end(&pcpu_b->seq);
 
 		local_irq_restore(flags);
