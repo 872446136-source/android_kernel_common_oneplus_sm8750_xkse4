@@ -1957,7 +1957,7 @@ static ssize_t adios_batch_limit_##name##_store( \
 	unsigned long max_batch; \
 	int ret; \
 	ret = kstrtoul(page, 10, &max_batch); \
-	if (ret || max_batch == 0) \
+	if (ret || max_batch == 0 || max_batch > U32_MAX) \
 		return -EINVAL; \
 	struct adios_data *ad = e->elevator_data; \
 	ad->batch_limit[optype] = max_batch; \
