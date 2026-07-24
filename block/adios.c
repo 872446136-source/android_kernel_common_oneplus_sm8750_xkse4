@@ -355,8 +355,8 @@ static bool lm_update_small_buckets(struct latency_model *model,
 		outlier_percentile = 100;
 
 	// Calculate the threshold weight for outlier detection
-	threshold_weight = mul_u64_u32_div(total_weight,
-		outlier_percentile, 100);
+	threshold_weight = max_t(u64, mul_u64_u32_div(total_weight,
+		outlier_percentile, 100), 1);
 
 	// Identify the bucket that corresponds to the outlier threshold
 	for (u8 i = 0; i < LM_LAT_BUCKET_COUNT; i++) {
@@ -429,8 +429,8 @@ static bool lm_update_large_buckets(struct latency_model *model,
 		outlier_percentile = 100;
 
 	// Calculate the threshold weight for outlier detection
-	threshold_weight = mul_u64_u32_div(total_weight,
-		outlier_percentile, 100);
+	threshold_weight = max_t(u64, mul_u64_u32_div(total_weight,
+		outlier_percentile, 100), 1);
 
 	// Identify the bucket that corresponds to the outlier threshold
 	for (u8 i = 0; i < LM_LAT_BUCKET_COUNT; i++) {
