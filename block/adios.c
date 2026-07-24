@@ -17,6 +17,7 @@
 #include <linux/slab.h>
 #include <linux/timekeeping.h>
 #include <linux/percpu.h>
+#include <linux/overflow.h>
 #include <linux/string.h>
 #include <linux/list_sort.h>
 #include <linux/rcupdate.h>
@@ -708,16 +709,20 @@ static void latency_model_input(struct adios_data *ad,
 
 // Predict the latency for a given block size using the latency model
 static u64 latency_model_predict(struct latency_model *model, u32 block_size) {
-	u64 result;
+	u64 result, scaled, units;
 	struct latency_model_params *params;
 
 	rcu_read_lock();
 	params = rcu_dereference(model->params);
 
 	result = params->base;
-	if (block_size > LM_BLOCK_SIZE_THRESHOLD)
-		result += params->slope *
-			DIV_ROUND_UP_ULL(block_size - LM_BLOCK_SIZE_THRESHOLD, 1024);
+	if (block_size > LM_BLOCK_SIZE_THRESHOLD) {
+		units = DIV_ROUND_UP_ULL(block_size - LM_BLOCK_SIZE_THRESHOLD,
+					 1024);
+		if (check_mul_overflow(params->slope, units, &scaled) ||
+		    check_add_overflow(result, scaled, &result))
+			result = U64_MAX;
+	}
 
 	rcu_read_unlock();
 
