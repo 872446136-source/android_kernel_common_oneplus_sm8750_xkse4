@@ -62,10 +62,33 @@ static u32 cube_rtt_scale __read_mostly;
 static u32 beta_scale __read_mostly;
 static u64 cube_factor __read_mostly;
 
-/* Note parameters that are used for precomputing scale factors are read-only */
+static int cubictcp_set_beta(const char *val, const struct kernel_param *kp)
+{
+	int new_beta;
+	int ret;
+
+	ret = kstrtoint(val, 0, &new_beta);
+	if (ret)
+		return ret;
+	if (new_beta < 0 || new_beta >= BICTCP_BETA_SCALE)
+		return -EINVAL;
+
+	WRITE_ONCE(beta_scale,
+		8 * (BICTCP_BETA_SCALE + new_beta) / 3 /
+		(BICTCP_BETA_SCALE - new_beta));
+	WRITE_ONCE(*(int *)kp->arg, new_beta);
+	return 0;
+}
+
+static const struct kernel_param_ops cubictcp_beta_ops = {
+	.set = cubictcp_set_beta,
+	.get = param_get_int,
+};
+
+/* bic_scale remains read-only because the cube factors are precomputed. */
 module_param(fast_convergence, int, 0644);
 MODULE_PARM_DESC(fast_convergence, "turn on/off fast convergence");
-module_param(beta, int, 0644);
+module_param_cb(beta, &cubictcp_beta_ops, &beta, 0644);
 MODULE_PARM_DESC(beta, "beta for multiplicative increase");
 module_param(initial_ssthresh, int, 0644);
 MODULE_PARM_DESC(initial_ssthresh, "initial value of slow start threshold");
