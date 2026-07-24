@@ -477,9 +477,12 @@ static bool lm_update_large_buckets(struct latency_model *model,
 	}
 
 	// Accumulate the average delay into the statistics
-	intercept = params->base;
+	if (check_mul_overflow(params->base, sum_weight, &intercept))
+		intercept = U64_MAX;
 	if (sum_latency > intercept)
 		sum_latency -= intercept;
+	else
+		sum_latency = 0;
 
 	params->large_sum_delay += sum_latency;
 	params->large_sum_bsize += sum_block_size;
