@@ -1404,10 +1404,16 @@ static struct request *dispatch_from_pq(struct adios_data *ad) {
 
 	guard(spinlock_irqsave)(&ad->pq_lock);
 	u32 pq_state = eval_adios_state(ad, ADIOS_STATE_PQ);
-	u8  pq_idx = pq_state >> 1;
-	struct list_head *q = &ad->prio_queue[pq_idx];
+	u8 pq_idx;
+	struct list_head *q;
 
-	if (unlikely(list_empty(q))) return NULL;
+	if (unlikely(!pq_state))
+		return NULL;
+
+	pq_idx = __builtin_ctz(pq_state);
+	q = &ad->prio_queue[pq_idx];
+	if (unlikely(list_empty(q)))
+		return NULL;
 
 	rq = list_first_entry(q, struct request, queuelist);
 	list_del_init(&rq->queuelist);
