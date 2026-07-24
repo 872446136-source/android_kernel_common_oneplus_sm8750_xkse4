@@ -77,9 +77,6 @@ static void drain_openssl_errors(void)
 		}					\
 	} while(0)
 
-#ifdef USE_PKCS11_ENGINE
-static const char *key_pass;
-#endif
 static BIO *wb;
 static char *cert_dst;
 static bool verbose;
@@ -111,10 +108,6 @@ int main(int argc, char **argv)
 	if (verbose_env && strchr(verbose_env, '1'))
 		verbose = true;
 
-#ifdef USE_PKCS11_ENGINE
-	key_pass = getenv("KBUILD_SIGN_PIN");
-#endif
-
 	if (argc != 3)
 		format();
 
@@ -133,6 +126,7 @@ int main(int argc, char **argv)
 		exit(1);
 #else
 		ENGINE *e;
+		const char *key_pass = getenv("KBUILD_SIGN_PIN");
 		struct {
 			const char *cert_id;
 			X509 *cert;
