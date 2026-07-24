@@ -178,6 +178,17 @@ static void brutal_init(struct sock *sk)
 #endif
 }
 
+static void brutal_release(struct sock *sk)
+{
+    if (sk->sk_family == AF_INET && sk->sk_prot == &tcp_prot_override)
+        sk->sk_prot = &tcp_prot;
+#ifdef _TRANSP_V6_H
+    else if (sk->sk_family == AF_INET6 &&
+             sk->sk_prot == &tcpv6_prot_override)
+        sk->sk_prot = &tcpv6_prot;
+#endif
+}
+
 // Copied from tcp.h for compatibility reasons
 static inline u32 brutal_tcp_snd_cwnd(const struct tcp_sock *tp)
 {
@@ -314,6 +325,7 @@ static struct tcp_congestion_ops tcp_brutal_ops = {
     .name = "brutal",
     .owner = THIS_MODULE,
     .init = brutal_init,
+    .release = brutal_release,
     .cong_control = brutal_main,
     .undo_cwnd = brutal_undo_cwnd,
     .ssthresh = brutal_ssthresh,
