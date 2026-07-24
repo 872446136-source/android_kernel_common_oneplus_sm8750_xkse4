@@ -93,10 +93,33 @@ static u32 c2tcp_cube_rtt_scale __read_mostly;
 static u32 c2tcp_beta_scale __read_mostly;
 static u64 c2tcp_cube_factor __read_mostly;
 
-/* Parameters used for precomputing scale factors are read-only. */
+static int c2tcp_set_beta(const char *val, const struct kernel_param *kp)
+{
+	int beta;
+	int ret;
+
+	ret = kstrtoint(val, 0, &beta);
+	if (ret)
+		return ret;
+	if (beta < 0 || beta >= C2TCP_BETA_SCALE)
+		return -EINVAL;
+
+	WRITE_ONCE(c2tcp_beta_scale,
+		8 * (C2TCP_BETA_SCALE + beta) / 3 /
+		(C2TCP_BETA_SCALE - beta));
+	WRITE_ONCE(*(int *)kp->arg, beta);
+	return 0;
+}
+
+static const struct kernel_param_ops c2tcp_beta_ops = {
+	.set = c2tcp_set_beta,
+	.get = param_get_int,
+};
+
+/* bic_scale remains read-only because the cube factors are precomputed. */
 module_param_named(fast_convergence, c2tcp_fast_convergence, int, 0644);
 MODULE_PARM_DESC(fast_convergence, "turn on/off fast convergence");
-module_param_named(beta, c2tcp_beta, int, 0644);
+module_param_cb(beta, &c2tcp_beta_ops, &c2tcp_beta, 0644);
 MODULE_PARM_DESC(beta, "beta for multiplicative increase");
 module_param_named(initial_ssthresh, c2tcp_initial_ssthresh, int, 0644);
 MODULE_PARM_DESC(initial_ssthresh, "initial value of slow start threshold");
