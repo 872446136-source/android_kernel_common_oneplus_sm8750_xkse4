@@ -1917,7 +1917,6 @@ static ssize_t adios_lat_model_##name##_store( \
 	if (ret != 2) \
 		return -EINVAL; \
 	sideload_latency_model(model, base, slope); \
-	reset_buckets(ad->aggr_buckets); \
 	return count; \
 } \
 static ssize_t adios_lat_target_##name##_show( \
