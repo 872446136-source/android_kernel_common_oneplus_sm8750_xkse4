@@ -904,16 +904,23 @@ void pm_print_active_wakeup_sources(void)
 	struct wakeup_source *ws;
 	int srcuidx, active = 0;
 	struct wakeup_source *last_activity_ws = NULL;
+#ifdef CONFIG_BOEFFLA_WL_BLOCKER
+	unsigned long flags;
+#endif
 
 	srcuidx = srcu_read_lock(&wakeup_srcu);
 	list_for_each_entry_rcu_locked(ws, &wakeup_sources, entry) {
 		if (ws->active) {
 			pm_pr_dbg("active wakeup source: %s\n", ws->name);
-			
+
 #ifdef CONFIG_BOEFFLA_WL_BLOCKER
-			if (!check_for_block(ws))	// AP: check if wakelock is on wakelock blocker list
-#endif
+			spin_lock_irqsave(&ws->lock, flags);
+			if (!check_for_block(ws) && ws->active)
 				active = 1;
+			spin_unlock_irqrestore(&ws->lock, flags);
+#else
+			active = 1;
+#endif
 		} else if (!active &&
 			   (!last_activity_ws ||
 			    ktime_to_ns(ws->last_time) >
