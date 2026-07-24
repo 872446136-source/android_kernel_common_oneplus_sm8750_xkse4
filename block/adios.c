@@ -1859,14 +1859,14 @@ static void adios_exit_sched(struct elevator_queue *e) {
 	kfree(ad);
 }
 
-static void sideload_latency_model(
+static int sideload_latency_model(
 		struct latency_model *model, u64 base, u64 slope) {
 	struct latency_model_params *old_params, *new_params;
 	unsigned long flags;
 
 	new_params = kzalloc(sizeof(*new_params), GFP_KERNEL);
 	if (!new_params)
-		return;
+		return -ENOMEM;
 
 	spin_lock_irqsave(&model->update_lock, flags);
 
@@ -1892,6 +1892,8 @@ static void sideload_latency_model(
 	spin_unlock_irqrestore(&model->update_lock, flags);
 
 	kfree_rcu(old_params, rcu);
+
+	return 0;
 }
 
 // Define sysfs attributes for operation types
@@ -1921,7 +1923,9 @@ static ssize_t adios_lat_model_##name##_store( \
 	ret = sscanf(page, "%llu %llu", &base, &slope); \
 	if (ret != 2) \
 		return -EINVAL; \
-	sideload_latency_model(model, base, slope); \
+	ret = sideload_latency_model(model, base, slope); \
+	if (ret) \
+		return ret; \
 	return count; \
 } \
 static ssize_t adios_lat_target_##name##_show( \
@@ -1937,7 +1941,9 @@ static ssize_t adios_lat_target_##name##_store( \
 	ret = kstrtoul(page, 10, &nsec); \
 	if (ret) \
 		return ret; \
-	sideload_latency_model(&ad->latency_model[optype], 0, 0); \
+	ret = sideload_latency_model(&ad->latency_model[optype], 0, 0); \
+	if (ret) \
+		return ret; \
 	ad->latency_target[optype] = nsec; \
 	return count; \
 } \
@@ -2088,7 +2094,9 @@ static ssize_t adios_reset_lat_model_store(
 
 		for (u8 i = 0; i < ADIOS_OPTYPES; i++) {
 			model = &ad->latency_model[i];
-			sideload_latency_model(model, 0, 0);
+			ret = sideload_latency_model(model, 0, 0);
+			if (ret)
+				return ret;
 		}
 	} else {
 		// Mode 2: Load initial values for all latency models.
@@ -2104,7 +2112,10 @@ static ssize_t adios_reset_lat_model_store(
 
 		for (u8 i = ADIOS_READ; i <= ADIOS_DISCARD; i++) {
 			model = &ad->latency_model[i];
-			sideload_latency_model(model, params[i][0], params[i][1]);
+			ret = sideload_latency_model(model,
+				params[i][0], params[i][1]);
+			if (ret)
+				return ret;
 		}
 	}
 	return count;
