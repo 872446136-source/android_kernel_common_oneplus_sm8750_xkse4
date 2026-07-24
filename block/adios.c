@@ -10,6 +10,7 @@
 #include <linux/init.h>
 #include <linux/kernel.h>
 #include <linux/math.h>
+#include <linux/math64.h>
 #include <linux/module.h>
 #include <linux/rbtree.h>
 #include <linux/sbitmap.h>
@@ -354,7 +355,8 @@ static bool lm_update_small_buckets(struct latency_model *model,
 		outlier_percentile = 100;
 
 	// Calculate the threshold weight for outlier detection
-	threshold_weight = (total_weight * outlier_percentile) / 100;
+	threshold_weight = mul_u64_u32_div(total_weight,
+		outlier_percentile, 100);
 
 	// Identify the bucket that corresponds to the outlier threshold
 	for (u8 i = 0; i < LM_LAT_BUCKET_COUNT; i++) {
@@ -376,8 +378,9 @@ static bool lm_update_small_buckets(struct latency_model *model,
 			u64 remaining_weight =
 				threshold_weight - (cumulative_weight - bucket->sum_of_weights);
 			if (bucket->sum_of_weights > 0) {
-				sum_latency += div_u64(bucket->weighted_sum_latency *
-					remaining_weight, bucket->sum_of_weights);
+				sum_latency += mul_u64_u64_div_u64(
+					bucket->weighted_sum_latency, remaining_weight,
+					bucket->sum_of_weights);
 				sum_weight += remaining_weight;
 			}
 		}
@@ -427,7 +430,8 @@ static bool lm_update_large_buckets(struct latency_model *model,
 		outlier_percentile = 100;
 
 	// Calculate the threshold weight for outlier detection
-	threshold_weight = (total_weight * outlier_percentile) / 100;
+	threshold_weight = mul_u64_u32_div(total_weight,
+		outlier_percentile, 100);
 
 	// Identify the bucket that corresponds to the outlier threshold
 	for (u8 i = 0; i < LM_LAT_BUCKET_COUNT; i++) {
@@ -450,10 +454,12 @@ static bool lm_update_large_buckets(struct latency_model *model,
 			u64 remaining_weight =
 				threshold_weight - (cumulative_weight - bucket->sum_of_weights);
 			if (bucket->sum_of_weights > 0) {
-				sum_latency += div_u64(bucket->weighted_sum_latency *
-					remaining_weight, bucket->sum_of_weights);
-				sum_block_size += div_u64(bucket->weighted_sum_block_size *
-					remaining_weight, bucket->sum_of_weights);
+				sum_latency += mul_u64_u64_div_u64(
+					bucket->weighted_sum_latency, remaining_weight,
+					bucket->sum_of_weights);
+				sum_block_size += mul_u64_u64_div_u64(
+					bucket->weighted_sum_block_size, remaining_weight,
+					bucket->sum_of_weights);
 				sum_weight += remaining_weight;
 			}
 		}
