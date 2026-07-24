@@ -700,7 +700,7 @@ static void latency_model_input(struct adios_data *ad,
 		buckets->large_bucket[bucket_index].weighted_sum_latency +=
 			latency * weight;
 		buckets->large_bucket[bucket_index].weighted_sum_block_size +=
-			block_size * weight;
+			(u64)block_size * weight;
 		write_seqcount_end(&pcpu_b->seq);
 
 		local_irq_restore(flags);
