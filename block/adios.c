@@ -1345,7 +1345,8 @@ static struct request *pop_next_bq_request_elevator(struct adios_data *ad) {
 	rq = pop_bq_request(ad, bq_idx, direction);
 
 	/* If batch queue for the sync requests just became empty */
-	if (bq_idx == 0 && rq && !(bq_state & 0x1))
+	if (bq_idx == 0 && rq &&
+	    !(ad->bq_state[ad->bq_page] & 0x1))
 		update_elv_direction(ad);
 
 	return rq;
