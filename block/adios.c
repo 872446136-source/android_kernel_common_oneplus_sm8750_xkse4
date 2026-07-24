@@ -20,6 +20,7 @@
 #include <linux/string.h>
 #include <linux/list_sort.h>
 #include <linux/rcupdate.h>
+#include <linux/seqlock.h>
 
 #include "elevator.h"
 #include "blk.h"
@@ -192,6 +193,11 @@ struct lm_buckets {
 	struct latency_bucket_large large_bucket[LM_LAT_BUCKET_COUNT];
 };
 
+struct lm_pcpu_buckets {
+	seqcount_t seq;
+	struct lm_buckets buckets;
+};
+
 // Structure to hold RCU-protected latency model parameters
 struct latency_model_params {
 	u64 base;
@@ -210,7 +216,7 @@ struct latency_model {
 	struct latency_model_params __rcu *params;
 
 	// Per-CPU buckets to avoid lock contention on the completion path
-	struct lm_buckets __percpu *pcpu_buckets;
+	struct lm_pcpu_buckets __percpu *pcpu_buckets;
 	// Per-CPU snapshots for delta-based aggregation (accessed under update_lock)
 	struct lm_buckets __percpu *pcpu_snapshot;
 	struct lm_buckets *aggr_buckets;
@@ -480,9 +486,33 @@ static void reset_buckets(struct lm_buckets *buckets)
 
 static void lm_reset_pcpu_buckets(struct latency_model *model) {
 	int cpu;
+
 	for_each_possible_cpu(cpu) {
-		reset_buckets(per_cpu_ptr(model->pcpu_buckets, cpu));
-		reset_buckets(per_cpu_ptr(model->pcpu_snapshot, cpu));
+		struct lm_pcpu_buckets *pcpu_b;
+		struct lm_buckets *snap;
+
+		pcpu_b = per_cpu_ptr(model->pcpu_buckets, cpu);
+		snap = per_cpu_ptr(model->pcpu_snapshot, cpu);
+
+		for (u8 i = 0; i < LM_LAT_BUCKET_COUNT; i++) {
+			unsigned int seq;
+			u64 sw, sl, lw, ll, lb;
+
+			do {
+				seq = read_seqcount_begin(&pcpu_b->seq);
+				sw = pcpu_b->buckets.small_bucket[i].sum_of_weights;
+				sl = pcpu_b->buckets.small_bucket[i].weighted_sum_latency;
+				lw = pcpu_b->buckets.large_bucket[i].sum_of_weights;
+				ll = pcpu_b->buckets.large_bucket[i].weighted_sum_latency;
+				lb = pcpu_b->buckets.large_bucket[i].weighted_sum_block_size;
+			} while (read_seqcount_retry(&pcpu_b->seq, seq));
+
+			snap->small_bucket[i].sum_of_weights = sw;
+			snap->small_bucket[i].weighted_sum_latency = sl;
+			snap->large_bucket[i].sum_of_weights = lw;
+			snap->large_bucket[i].weighted_sum_latency = ll;
+			snap->large_bucket[i].weighted_sum_block_size = lb;
+		}
 	}
 }
 
@@ -496,7 +526,8 @@ static void latency_model_update(
 	struct lm_buckets *aggr = model->aggr_buckets;
 	struct latency_bucket_small *asb;
 	struct latency_bucket_large *alb;
-	struct lm_buckets *pcpu_b, *snap;
+	struct lm_pcpu_buckets *pcpu_b;
+	struct lm_buckets *snap;
 	unsigned long flags;
 	int cpu;
 	struct latency_model_params *old_params, *new_params;
@@ -518,10 +549,21 @@ static void latency_model_update(
 		snap   = per_cpu_ptr(model->pcpu_snapshot, cpu);
 
 		for (u8 i = 0; i < LM_LAT_BUCKET_COUNT; i++) {
-			u64 sw  = pcpu_b->small_bucket[i].sum_of_weights;
-			u64 sl  = pcpu_b->small_bucket[i].weighted_sum_latency;
-			u64 dsw = sw - snap->small_bucket[i].sum_of_weights;
-			u64 dsl = sl - snap->small_bucket[i].weighted_sum_latency;
+			unsigned int seq;
+			u64 sw, sl, lw, ll, lb;
+			u64 dsw, dsl, dlw, dll, dlb;
+
+			do {
+				seq = read_seqcount_begin(&pcpu_b->seq);
+				sw = pcpu_b->buckets.small_bucket[i].sum_of_weights;
+				sl = pcpu_b->buckets.small_bucket[i].weighted_sum_latency;
+				lw = pcpu_b->buckets.large_bucket[i].sum_of_weights;
+				ll = pcpu_b->buckets.large_bucket[i].weighted_sum_latency;
+				lb = pcpu_b->buckets.large_bucket[i].weighted_sum_block_size;
+			} while (read_seqcount_retry(&pcpu_b->seq, seq));
+
+			dsw = sw - snap->small_bucket[i].sum_of_weights;
+			dsl = sl - snap->small_bucket[i].weighted_sum_latency;
 			snap->small_bucket[i].sum_of_weights = sw;
 			snap->small_bucket[i].weighted_sum_latency = sl;
 			if (dsw) {
@@ -530,12 +572,9 @@ static void latency_model_update(
 				asb->weighted_sum_latency += dsl;
 			}
 
-			u64 lw  = pcpu_b->large_bucket[i].sum_of_weights;
-			u64 ll  = pcpu_b->large_bucket[i].weighted_sum_latency;
-			u64 lb  = pcpu_b->large_bucket[i].weighted_sum_block_size;
-			u64 dlw = lw - snap->large_bucket[i].sum_of_weights;
-			u64 dll = ll - snap->large_bucket[i].weighted_sum_latency;
-			u64 dlb = lb - snap->large_bucket[i].weighted_sum_block_size;
+			dlw = lw - snap->large_bucket[i].sum_of_weights;
+			dll = ll - snap->large_bucket[i].weighted_sum_latency;
+			dlb = lb - snap->large_bucket[i].weighted_sum_block_size;
 			snap->large_bucket[i].sum_of_weights = lw;
 			snap->large_bucket[i].weighted_sum_latency = ll;
 			snap->large_bucket[i].weighted_sum_block_size = lb;
@@ -616,12 +655,14 @@ static void latency_model_input(struct adios_data *ad,
 		u32 block_size, u64 latency, u64 pred_lat, u32 weight) {
 	unsigned long flags;
 	u8 bucket_index;
+	struct lm_pcpu_buckets *pcpu_b;
 	struct lm_buckets *buckets;
 	u64 current_base;
 	struct latency_model_params *params;
 
 	local_irq_save(flags);
-	buckets = per_cpu_ptr(model->pcpu_buckets, __smp_processor_id());
+	pcpu_b = per_cpu_ptr(model->pcpu_buckets, __smp_processor_id());
+	buckets = &pcpu_b->buckets;
 
 	rcu_read_lock();
 	params = rcu_dereference(model->params);
@@ -632,9 +673,11 @@ static void latency_model_input(struct adios_data *ad,
 		// Handle small requests
 		bucket_index = lm_input_bucket_index(latency, current_base ?: 1);
 
+		write_seqcount_begin(&pcpu_b->seq);
 		buckets->small_bucket[bucket_index].sum_of_weights += weight;
 		buckets->small_bucket[bucket_index].weighted_sum_latency +=
 			latency * weight;
+		write_seqcount_end(&pcpu_b->seq);
 
 		local_irq_restore(flags);
 
@@ -651,11 +694,13 @@ static void latency_model_input(struct adios_data *ad,
 
 		bucket_index = lm_input_bucket_index(latency, pred_lat);
 
+		write_seqcount_begin(&pcpu_b->seq);
 		buckets->large_bucket[bucket_index].sum_of_weights += weight;
 		buckets->large_bucket[bucket_index].weighted_sum_latency +=
 			latency * weight;
 		buckets->large_bucket[bucket_index].weighted_sum_block_size +=
 			block_size * weight;
+		write_seqcount_end(&pcpu_b->seq);
 
 		local_irq_restore(flags);
 	}
@@ -1602,6 +1647,7 @@ static int adios_init_hctx(struct blk_mq_hw_ctx *hctx, unsigned int hctx_idx) {
 static int adios_init_sched(struct request_queue *q, struct elevator_type *e) {
 	struct adios_data *ad;
 	struct elevator_queue *eq;
+	int cpu;
 	int ret = -ENOMEM;
 	u8 optype = 0;
 
@@ -1681,7 +1727,7 @@ static int adios_init_sched(struct request_queue *q, struct elevator_type *e) {
 			goto free_buckets;
 		}
 
-		model->pcpu_buckets = alloc_percpu(struct lm_buckets);
+		model->pcpu_buckets = alloc_percpu(struct lm_pcpu_buckets);
 		if (!model->pcpu_buckets) {
 			pr_err("adios: Failed to allocate per-CPU buckets\n");
 			kfree(model->aggr_buckets);
@@ -1697,6 +1743,9 @@ static int adios_init_sched(struct request_queue *q, struct elevator_type *e) {
 			kfree(params);
 			goto free_buckets;
 		}
+
+		for_each_possible_cpu(cpu)
+			seqcount_init(&per_cpu_ptr(model->pcpu_buckets, cpu)->seq);
 
 		model->lm_shrink_at_kreqs  = default_lm_shrink_at_kreqs;
 		model->lm_shrink_at_gbytes = default_lm_shrink_at_gbytes;
