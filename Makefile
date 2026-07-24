@@ -881,7 +881,7 @@ endif
 # so we tell Polly to perfom proven DCE on the loops it optimises
 # in order to preserve the overall effect of the linker's DCE.
 ifdef CONFIG_LD_DEAD_CODE_DATA_ELIMINATION
-POLLY_FLAGS	+= -mllvm -polly-run-dce
+KBUILD_CFLAGS	+= -mllvm -polly-run-dce
 endif
 endif
 
