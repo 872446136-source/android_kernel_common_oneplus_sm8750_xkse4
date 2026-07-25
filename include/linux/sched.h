@@ -75,6 +75,9 @@ struct task_group;
 struct user_event_mm;
 
 #include <linux/sched/ext.h>
+#ifdef CONFIG_HMBIRD_SCHED
+#include <linux/sched/hmbird.h>
+#endif
 
 /*
  * Task state bitmask. NOTE! These bits are also
@@ -1948,6 +1951,91 @@ static inline int task_nice(const struct task_struct *p)
 {
 	return PRIO_TO_NICE((p)->static_prio);
 }
+
+#ifdef CONFIG_HMBIRD_SCHED
+static inline bool task_is_top_task(const struct task_struct *p)
+{
+	struct hmbird_entity *entity = p ? get_hmbird_ts(p) : NULL;
+
+	return entity && (entity->top_task_prop & TOP_TASK_BITS_MASK);
+}
+
+static inline int get_top_task_prop(const struct task_struct *p)
+{
+	struct hmbird_entity *entity = p ? get_hmbird_ts(p) : NULL;
+
+	return entity ? entity->top_task_prop : 0;
+}
+
+static inline int set_top_task_prop(struct task_struct *p, u64 set, u64 clear)
+{
+	struct hmbird_entity *entity = p ? get_hmbird_ts(p) : NULL;
+
+	if (!entity)
+		return -EINVAL;
+	if (set)
+		entity->top_task_prop |= set;
+	if (clear)
+		entity->top_task_prop &= ~clear;
+	return 0;
+}
+
+static inline void reset_top_task_prop(struct task_struct *p)
+{
+	struct hmbird_entity *entity = p ? get_hmbird_ts(p) : NULL;
+
+	if (entity)
+		entity->top_task_prop = 0;
+}
+
+static inline int hmbird_set_sched_prop(struct task_struct *p, unsigned long sp)
+{
+	struct hmbird_entity *entity = p ? get_hmbird_ts(p) : NULL;
+
+	if (!entity)
+		return -EINVAL;
+	entity->sched_prop = sp;
+	return 0;
+}
+
+static inline unsigned long hmbird_get_sched_prop(const struct task_struct *p)
+{
+	struct hmbird_entity *entity = p ? get_hmbird_ts(p) : NULL;
+
+	return entity ? entity->sched_prop : 0;
+}
+
+static inline void hmbird_set_dsq_id(struct task_struct *p, unsigned long dsq)
+{
+	struct hmbird_entity *entity = p ? get_hmbird_ts(p) : NULL;
+
+	if (entity)
+		entity->sched_prop =
+			(entity->sched_prop & ~SCHED_PROP_DEADLINE_MASK) | dsq;
+}
+
+static inline unsigned long hmbird_get_dsq_id(const struct task_struct *p)
+{
+	struct hmbird_entity *entity = p ? get_hmbird_ts(p) : NULL;
+
+	return entity ? entity->sched_prop & SCHED_PROP_DEADLINE_MASK : 0;
+}
+
+static inline void hmbird_set_dsq_sync_ux(struct task_struct *p, int val)
+{
+	struct hmbird_entity *entity = p ? get_hmbird_ts(p) : NULL;
+
+	if (entity)
+		entity->dsq_sync_ux = val;
+}
+
+static inline int hmbird_get_dsq_sync_ux(const struct task_struct *p)
+{
+	struct hmbird_entity *entity = p ? get_hmbird_ts(p) : NULL;
+
+	return entity ? entity->dsq_sync_ux : 0;
+}
+#endif
 
 
 extern int can_nice(const struct task_struct *p, const int nice);

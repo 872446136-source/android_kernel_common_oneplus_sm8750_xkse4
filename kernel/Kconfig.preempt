@@ -135,10 +135,20 @@ config SCHED_CORE
 
 config SLIM_SCHED
 	bool "slim sched"
+	depends on !HMBIRD_SCHED
 	default n
+
+config HMBIRD_SCHED
+	bool "OPlus HMBIRD scheduling class"
+	depends on OF
+	help
+	  Enable the in-kernel OPlus HMBIRD scheduling class, including its
+	  deadline dispatch queues, Slim WALT accounting and high-resolution
+	  shadow tick support.
+
 config SCHED_CLASS_EXT
 	bool "Extensible Scheduling Class"
-	depends on BPF_SYSCALL && BPF_JIT
+	depends on BPF_SYSCALL && BPF_JIT && !HMBIRD_SCHED
 	help
 	  This option enables a new scheduler class sched_ext (SCX), which
 	  allows scheduling policies to be implemented as BPF programs to

@@ -190,6 +190,10 @@ static inline int idle_policy(int policy)
 
 static inline int normal_policy(int policy)
 {
+#ifdef CONFIG_HMBIRD_SCHED
+	if (policy == SCHED_HMBIRD)
+		return true;
+#endif
 #ifdef CONFIG_SCHED_CLASS_EXT
 	if (policy == SCHED_EXT)
 		return true;
@@ -3704,5 +3708,8 @@ static inline bool cpu_busy_with_softirqs(int cpu)
 #endif /* CONFIG_RT_SOFTIRQ_AWARE_SCHED */
 
 #include "ext.h"
+#ifdef CONFIG_HMBIRD_SCHED
+#include "hmbird.h"
+#endif
 
 #endif /* _KERNEL_SCHED_SCHED_H */

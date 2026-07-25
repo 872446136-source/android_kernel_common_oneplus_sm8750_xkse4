@@ -7800,6 +7800,10 @@ cpu_util(int cpu, struct task_struct *p, int dst_cpu, int boost)
 		util = max(util, util_est);
 	}
 
+#ifdef CONFIG_HMBIRD_SCHED
+	if (hmbird_enabled())
+		util = max(util, (unsigned long)hmbird_cpu_util(cpu));
+#endif
 	return min(util, arch_scale_cpu_capacity(cpu));
 }
 

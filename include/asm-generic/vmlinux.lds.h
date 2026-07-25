@@ -119,6 +119,18 @@
 #define STRUCT_ALIGNMENT 32
 #define STRUCT_ALIGN() . = ALIGN(STRUCT_ALIGNMENT)
 
+#ifdef CONFIG_HMBIRD_SCHED
+#define HMBIRD_SCHED_DATA	*(__hmbird_sched_class)
+#else
+#define HMBIRD_SCHED_DATA
+#endif
+
+#ifdef CONFIG_SCHED_CLASS_EXT
+#define EXT_SCHED_DATA		*(__ext_sched_class)
+#else
+#define EXT_SCHED_DATA
+#endif
+
 /*
  * The order of the sched class addresses are important, as they are
  * used to determine the order of the priority of each sched class in
@@ -131,7 +143,8 @@
 	*(__dl_sched_class)			\
 	*(__rt_sched_class)			\
 	*(__fair_sched_class)			\
-	*(__ext_sched_class)			\
+	HMBIRD_SCHED_DATA			\
+	EXT_SCHED_DATA				\
 	*(__idle_sched_class)			\
 	__sched_class_lowest = .;
 

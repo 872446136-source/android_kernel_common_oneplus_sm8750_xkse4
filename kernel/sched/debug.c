@@ -379,6 +379,10 @@ static __init int sched_init_debug(void)
 #ifdef CONFIG_SCHED_CLASS_EXT
 	debugfs_create_file("ext", 0444, debugfs_sched, NULL, &sched_ext_fops);
 #endif
+#ifdef CONFIG_HMBIRD_SCHED
+	debugfs_create_file("hmbird", 0444, debugfs_sched, NULL,
+			    &sched_hmbird_fops);
+#endif
 	return 0;
 }
 late_initcall(sched_init_debug);
@@ -1106,6 +1110,11 @@ void proc_sched_show_task(struct task_struct *p, struct pid_namespace *ns,
 	}
 #ifdef CONFIG_SCHED_CLASS_EXT
 	__PS("ext.enabled", p->sched_class == &ext_sched_class);
+#endif
+#ifdef CONFIG_HMBIRD_SCHED
+	__PS("hmbird.enabled", p->sched_class == &hmbird_sched_class);
+	__PS("sched_prop", hmbird_get_sched_prop(p));
+	__PS("top_task_prop", get_top_task_prop(p));
 #endif
 #undef PN_SCHEDSTAT
 #undef P_SCHEDSTAT

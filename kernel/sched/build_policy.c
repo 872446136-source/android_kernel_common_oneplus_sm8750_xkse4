@@ -54,6 +54,14 @@
 #include "cputime.c"
 #include "deadline.c"
 
+#ifdef CONFIG_HMBIRD_SCHED
+# include "hmbird/hmbird_util_track.c"
+# include "hmbird/hmbird_sched_proc.c"
+# include "hmbird/hmbird_shadow_tick.c"
+# include "hmbird/hmbird.c"
+# include "hmbird/hmbird_misc.c"
+#endif
+
 #ifdef CONFIG_SCHED_CLASS_EXT
 # include "ext.c"
 #endif
