@@ -15,7 +15,7 @@
 
 noinline int tracing_mark_write(const char *buf)
 {
-	trace_printk(buf);
+	trace_printk("%s", buf);
 	return 0;
 }
 
@@ -51,15 +51,17 @@ void hmbird_skip_yield(long *skip)
 		return;
 	unsigned long flags, sleep_now = 0;
 	struct sched_yield_state *ys;
-	int cpu = raw_smp_processor_id(), cont_yield, new_frame;
+	int cpu, cont_yield, new_frame;
 	int frame_time_ns = yield_opt_params.frame_time_ns;
 	int yield_headroom = yield_opt_params.yield_headroom;
 	u64 wc;
 
 	if (!(*skip)) {
 		wc = sched_clock();
+		cpu = get_cpu();
 		ys = &per_cpu(ystate, cpu);
 		raw_spin_lock_irqsave(&ys->lock, flags);
+		put_cpu();
 
 		cont_yield = (wc - ys->last_yield_time) < MIN_YIELD_SLEEP;
 		new_frame = (wc - ys->last_update_time) > (frame_time_ns >> 1);
@@ -89,8 +91,10 @@ void hmbird_skip_yield(long *skip)
 				sleep_now = div64_u64(sleep_now, 1000);
 				usleep_range_state(sleep_now, sleep_now, TASK_IDLE);
 			}
+			raw_spin_lock_irqsave(&ys->lock, flags);
 			ys->sleep_times++;
 			ys->last_yield_time = sched_clock();
+			raw_spin_unlock_irqrestore(&ys->lock, flags);
 			return;
 		}
 		if (ys->sleep_times)
