@@ -482,14 +482,17 @@ struct drm_mode_config {
 	int num_encoder;
 #ifndef __GENKSYMS__ /* Placed in an existing hole in the structure. */
 	/**
-	 * @encoder_clones_explicit:
+	 * @encoder_clones_implicit:
 	 *
-	 * Bitmask of encoders for which the driver explicitly initialized
-	 * &drm_encoder.possible_clones before mode-config validation. Encoders
-	 * without a bit set predate generic clone validation and remain subject
-	 * to the driver's atomic checks.
+	 * Bitmask of encoders whose zero possible_clones value was
+	 * automatically replaced with the encoder's own mask during
+	 * mode-config validation.
+	 *
+	 * These encoders did not provide an explicit clone topology and may
+	 * require compatibility handling for downstream virtual writeback
+	 * paths.
 	 */
-	u32 encoder_clones_explicit;
+	u32 encoder_clones_implicit;
 #endif
 	/**
 	 * @encoder_list:
