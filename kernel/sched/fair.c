@@ -10060,6 +10060,7 @@ static inline void update_sg_lb_stats(struct lb_env *env,
 				      int *sg_status)
 {
 	int i, nr_running, local_group, sd_flags = env->sd->flags;
+	bool balancing_at_rd = !env->sd->parent;
 
 	memset(sgs, 0, sizeof(*sgs));
 
@@ -10077,9 +10078,6 @@ static inline void update_sg_lb_stats(struct lb_env *env,
 		nr_running = rq->nr_running;
 		sgs->sum_nr_running += nr_running;
 
-		if (nr_running > 1)
-			*sg_status |= SG_OVERLOAD;
-
 		if (cpu_overutilized(i)) {
 			*sg_status |= SG_OVERUTILIZED;
 			sgs->nr_overutilized++;
@@ -10093,6 +10091,10 @@ static inline void update_sg_lb_stats(struct lb_env *env,
 			/* Idle cpu can't have misfit task */
 			continue;
 		}
+
+		/* Overload indicator is only updated at root domain */
+		if (balancing_at_rd && nr_running > 1)
+			*sg_status |= SG_OVERLOAD;
 
 #ifdef CONFIG_NUMA_BALANCING
 		/* Only fbq_classify_group() uses this to classify NUMA groups */
@@ -10109,7 +10111,8 @@ static inline void update_sg_lb_stats(struct lb_env *env,
 			if (sgs->group_misfit_task_load < rq->misfit_task_load) {
 				sgs->group_misfit_task_load = rq->misfit_task_load;
 				sgs->group_misfit_reason = rq->misfit_reason;
-				*sg_status |= SG_OVERLOAD;
+				if (balancing_at_rd)
+					*sg_status |= SG_OVERLOAD;
 			}
 		} else if ((env->idle != CPU_NOT_IDLE) &&
 			   sched_reduced_capacity(rq, env->sd)) {
