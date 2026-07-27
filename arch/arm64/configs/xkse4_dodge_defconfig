@@ -96,7 +96,6 @@ CONFIG_DAMON_LRU_SORT=y
 CONFIG_NET_SCH_CAKE=y
 CONFIG_CMDLINE="console=ttynull stack_depot_disable=on init_on_alloc=0 cgroup_disable=pressure kasan=off kfence.sample_interval=0 rcu_nocbs=all rcutree.enable_rcu_lazy=1 bootconfig ioremap_guard"
 CONFIG_CMDLINE_EXTEND=y
-# CONFIG_READ_ONLY_THP_FOR_FS is not set
 # CONFIG_CMDLINE="console=ttynull stack_depot_disable=on cgroup_disable=pressure kasan.stacktrace=off kvm-arm.mode=protected bootconfig ioremap_guard rcu_nocbs=all rcutree.enable_rcu_lazy=1"
 
 # EDIT15 -- passed
@@ -170,7 +169,6 @@ CONFIG_PM_WAKELOCKS_GC=y
 
 # EDIT25 -- passed
 CONFIG_F2FS_FS_POSIX_ACL=y
-# CONFIG_MPTCP is not set
 CONFIG_RELR=y
 CONFIG_KALLSYMS_FAST_LOOKUP=y
 
@@ -189,14 +187,6 @@ CONFIG_HMBIRD_SCHED=y
 CONFIG_VXLAN=y
 CONFIG_BRIDGE_VLAN_FILTERING=y
 
-# Can't boot with these configs enabled
-# CONFIG_BRIDGE_NETFILTER is not set
-# CONFIG_CGROUP_PIDS is not set
-# CONFIG_CGROUP_DEVICE is not set
-# CONFIG_CFS_BANDWIDTH is not set
-# CONFIG_IPVLAN is not set
-# CONFIG_MACVLAN is not set
-
 
 # EDIT30 -- passed
 CONFIG_OVERLAY_FS_INDEX=y
@@ -209,6 +199,16 @@ CONFIG_NF_CONNTRACK_BRIDGE=m
 CONFIG_REGDB_FIRMWARE_OVERLAY=y
 CONFIG_MODULE_OVERLAY=n
 # CONFIG_RSEQ is not set
+
+# Can't boot with these configs enabled
+# CONFIG_BRIDGE_NETFILTER is not set
+# CONFIG_CGROUP_PIDS is not set
+# CONFIG_CGROUP_DEVICE is not set
+# CONFIG_CFS_BANDWIDTH is not set
+# CONFIG_IPVLAN is not set
+# CONFIG_MACVLAN is not set
+# CONFIG_MPTCP is not set
+# CONFIG_READ_ONLY_THP_FOR_FS is not set
 
 
 
