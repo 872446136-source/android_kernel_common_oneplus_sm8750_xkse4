@@ -2,7 +2,6 @@
 config ZRAM
 	tristate "Compressed RAM block device support"
 	depends on BLOCK && SYSFS && MMU
-	depends on CRYPTO_LZO || CRYPTO_ZSTD || CRYPTO_LZ4 || CRYPTO_LZ4HC || CRYPTO_LZ4K || CRYPTO_LZ4KD || CRYPTO_842
 	select ZSMALLOC
 	help
 	  Creates virtual block devices called /dev/zramX (X = 0, 1, ...).
@@ -15,6 +14,70 @@ config ZRAM
 
 	  See Documentation/admin-guide/blockdev/zram.rst for more information.
 
+config ZRAM_BACKEND_LZ4
+	bool "lz4 compression support"
+	depends on ZRAM
+	default y if CRYPTO_LZ4
+	select LZ4_COMPRESS
+	select LZ4_DECOMPRESS
+
+config ZRAM_BACKEND_LZ4HC
+	bool "lz4hc compression support"
+	depends on ZRAM
+	default y if CRYPTO_LZ4HC
+	select LZ4HC_COMPRESS
+	select LZ4_DECOMPRESS
+
+config ZRAM_BACKEND_LZ4K
+	bool "lz4k compression support"
+	depends on ZRAM
+	default y if CRYPTO_LZ4K
+	select LZ4K_COMPRESS
+	select LZ4K_DECOMPRESS
+
+config ZRAM_BACKEND_LZ4KD
+	bool "lz4kd compression support"
+	depends on ZRAM
+	default y
+	select LZ4KD_COMPRESS
+	select LZ4KD_DECOMPRESS
+
+config ZRAM_BACKEND_ZSTD
+	bool "zstd compression support"
+	depends on ZRAM
+	default y if CRYPTO_ZSTD
+	select ZSTD_COMPRESS
+	select ZSTD_DECOMPRESS
+
+config ZRAM_BACKEND_DEFLATE
+	bool "deflate compression support"
+	depends on ZRAM
+	default y if CRYPTO_DEFLATE
+	select ZLIB_DEFLATE
+	select ZLIB_INFLATE
+
+config ZRAM_BACKEND_842
+	bool "842 compression support"
+	depends on ZRAM
+	default y if CRYPTO_842
+	select 842_COMPRESS
+	select 842_DECOMPRESS
+
+config ZRAM_BACKEND_FORCE_LZO
+	depends on ZRAM
+	def_bool !ZRAM_BACKEND_LZ4 && !ZRAM_BACKEND_LZ4HC && \
+		!ZRAM_BACKEND_LZ4K && !ZRAM_BACKEND_LZ4KD && \
+		!ZRAM_BACKEND_ZSTD && !ZRAM_BACKEND_DEFLATE && \
+		!ZRAM_BACKEND_842
+
+config ZRAM_BACKEND_LZO
+	bool "lzo and lzo-rle compression support" if !ZRAM_BACKEND_FORCE_LZO
+	depends on ZRAM
+	default y if CRYPTO_LZO
+	default ZRAM_BACKEND_FORCE_LZO
+	select LZO_COMPRESS
+	select LZO_DECOMPRESS
+
 choice
 	prompt "Default zram compressor"
 	default ZRAM_DEF_COMP_LZ4KD
@@ -22,35 +85,39 @@ choice
 
 config ZRAM_DEF_COMP_LZORLE
 	bool "lzo-rle"
-	depends on CRYPTO_LZO
+	depends on ZRAM_BACKEND_LZO
 
 config ZRAM_DEF_COMP_ZSTD
 	bool "zstd"
-	depends on CRYPTO_ZSTD
+	depends on ZRAM_BACKEND_ZSTD
 
 config ZRAM_DEF_COMP_LZ4
 	bool "lz4"
-	depends on CRYPTO_LZ4
+	depends on ZRAM_BACKEND_LZ4
 
 config ZRAM_DEF_COMP_LZO
 	bool "lzo"
-	depends on CRYPTO_LZO
+	depends on ZRAM_BACKEND_LZO
 
 config ZRAM_DEF_COMP_LZ4K
 	bool "lz4k"
-	depends on CRYPTO_LZ4K
+	depends on ZRAM_BACKEND_LZ4K
 
 config ZRAM_DEF_COMP_LZ4KD
 	bool "lz4kd"
-	depends on CRYPTO_LZ4KD
+	depends on ZRAM_BACKEND_LZ4KD
 
 config ZRAM_DEF_COMP_LZ4HC
 	bool "lz4hc"
-	depends on CRYPTO_LZ4HC
+	depends on ZRAM_BACKEND_LZ4HC
+
+config ZRAM_DEF_COMP_DEFLATE
+	bool "deflate"
+	depends on ZRAM_BACKEND_DEFLATE
 
 config ZRAM_DEF_COMP_842
 	bool "842"
-	depends on CRYPTO_842
+	depends on ZRAM_BACKEND_842
 
 endchoice
 
@@ -63,7 +130,9 @@ config ZRAM_DEF_COMP
 	default "lz4k" if ZRAM_DEF_COMP_LZ4K
 	default "lz4kd" if ZRAM_DEF_COMP_LZ4KD
 	default "lz4hc" if ZRAM_DEF_COMP_LZ4HC
+	default "deflate" if ZRAM_DEF_COMP_DEFLATE
 	default "842" if ZRAM_DEF_COMP_842
+	default "unset-value"
 
 config ZRAM_WRITEBACK
        bool "Write back incompressible or idle page to backing device"
