@@ -38,6 +38,7 @@
 #include <linux/kernel_read_file.h>
 #include <linux/part_stat.h>
 #include <linux/rcupdate.h>
+#include <linux/sizes.h>
 #include <linux/sysctl.h>
 #include <linux/wait.h>
 #include <linux/overflow.h>
@@ -57,8 +58,9 @@ static unsigned int num_devices = 1;
 #ifdef CONFIG_ZRAM_WRITEBACK
 #define ZRAM_WB_UNITS_PER_PAGE	(1ULL << (PAGE_SHIFT - 12))
 #define ZRAM_DEFAULT_WB_BATCH_SIZE	32U
-#define ZRAM_DEFAULT_WB_BIO_PAGES	8U
-#define ZRAM_MAX_WB_BIO_PAGES		32U
+#define ZRAM_DEFAULT_WB_BIO_PAGES	16U
+#define ZRAM_MAX_WB_BIO_PAGES		64U
+#define ZRAM_MAX_WB_POOL_BYTES		SZ_16M
 #endif
 /*
  * Pages that compress to sizes equals or greater than this are stored
@@ -926,7 +928,6 @@ struct zram_wb_ctl {
 	spinlock_t done_lock;
 	atomic_t num_inflight;
 	u32 capacity;
-	struct rcu_head rcu;
 };
 
 struct zram_wb_entry {
@@ -996,6 +997,7 @@ static void release_wb_req(struct zram_wb_req *req)
 
 		WARN_ON_ONCE(entry->pps);
 		WARN_ON_ONCE(entry->blk_idx);
+		WARN_ON_ONCE(entry->index);
 		WARN_ON_ONCE(entry->expected_handle);
 		WARN_ON_ONCE(entry->expected_obj_size);
 		WARN_ON_ONCE(entry->expected_priority);
@@ -1008,7 +1010,8 @@ static void release_wb_req(struct zram_wb_req *req)
 	kfree(req);
 }
 
-static struct zram_wb_req *alloc_wb_req(u32 capacity)
+static struct zram_wb_req *alloc_wb_req(u32 capacity, size_t entries_size,
+					size_t bvecs_size)
 {
 	struct zram_wb_req *req;
 	u32 i;
@@ -1019,13 +1022,11 @@ static struct zram_wb_req *alloc_wb_req(u32 capacity)
 
 	INIT_LIST_HEAD(&req->entry);
 	req->capacity = capacity;
-	req->entries = kcalloc(capacity, sizeof(*req->entries),
-			       GFP_KERNEL | __GFP_NOWARN);
+	req->entries = kzalloc(entries_size, GFP_KERNEL | __GFP_NOWARN);
 	if (!req->entries)
 		goto fail;
 
-	req->bvecs = kcalloc(capacity, sizeof(*req->bvecs),
-			    GFP_KERNEL | __GFP_NOWARN);
+	req->bvecs = kzalloc(bvecs_size, GFP_KERNEL | __GFP_NOWARN);
 	if (!req->bvecs)
 		goto fail;
 
@@ -1043,10 +1044,75 @@ fail:
 	return NULL;
 }
 
+static u32 zram_wb_effective_capacity(struct zram *zram)
+{
+	struct request_queue *q = bdev_get_queue(zram->bdev);
+	u32 capacity;
+	u32 max_segments;
+	u32 sector_pages;
+
+	capacity = clamp_t(u32, zram->wb_bio_pages, 1U,
+			   ZRAM_MAX_WB_BIO_PAGES);
+	capacity = min_t(u32, capacity, BIO_MAX_VECS);
+	if (!q)
+		return 1;
+
+	max_segments = max_t(u32, queue_max_segments(q), 1U);
+	sector_pages = queue_max_sectors(q) >>
+		       (PAGE_SHIFT - SECTOR_SHIFT);
+	sector_pages = max_t(u32, sector_pages, 1U);
+	capacity = min(capacity, max_segments);
+	capacity = min(capacity, sector_pages);
+
+	return max_t(u32, capacity, 1U);
+}
+
+static bool zram_wb_pool_limits(struct zram *zram, u32 capacity,
+				u32 *request_count, size_t *entries_size,
+				size_t *bvecs_size)
+{
+	u64 per_request_page_bytes;
+	u64 pool_request_limit;
+	u64 total_pages;
+	u64 total_page_bytes;
+	u64 effective_request_count;
+	u32 nr_requests;
+
+	if (check_mul_overflow((size_t)capacity,
+			       sizeof(struct zram_wb_entry), entries_size) ||
+	    check_mul_overflow((size_t)capacity, sizeof(struct bio_vec),
+			       bvecs_size) ||
+	    check_mul_overflow((u64)capacity, (u64)PAGE_SIZE,
+			       &per_request_page_bytes) ||
+	    !per_request_page_bytes)
+		return false;
+
+	pool_request_limit = (u64)ZRAM_MAX_WB_POOL_BYTES /
+			     per_request_page_bytes;
+	if (!pool_request_limit)
+		return false;
+
+	effective_request_count =
+		min_t(u64, max_t(u32, zram->wb_batch_size, 1U),
+		      pool_request_limit);
+	if (!effective_request_count || effective_request_count > U32_MAX)
+		return false;
+	nr_requests = (u32)effective_request_count;
+	if (check_mul_overflow((u64)nr_requests, (u64)capacity,
+			       &total_pages) ||
+	    check_mul_overflow(total_pages, (u64)PAGE_SIZE,
+			       &total_page_bytes) ||
+	    total_page_bytes > ZRAM_MAX_WB_POOL_BYTES)
+		return false;
+
+	*request_count = max_t(u32, nr_requests, 1U);
+	return true;
+}
+
 static struct zram_wb_ctl *init_wb_ctl(struct zram *zram)
 {
 	struct zram_wb_ctl *ctl;
-	u32 capacity = zram->wb_bio_pages;
+	u32 capacity = zram_wb_effective_capacity(zram);
 
 	ctl = kzalloc(sizeof(*ctl), GFP_KERNEL | __GFP_NOWARN);
 	if (!ctl)
@@ -1059,12 +1125,19 @@ static struct zram_wb_ctl *init_wb_ctl(struct zram *zram)
 	atomic_set(&ctl->num_inflight, 0);
 
 	for (;;) {
+		size_t entries_size;
+		size_t bvecs_size;
+		u32 request_count;
 		u32 nr = 0;
 
-		while (nr < zram->wb_batch_size) {
+		if (!zram_wb_pool_limits(zram, capacity, &request_count,
+					 &entries_size, &bvecs_size))
+			goto reduce_capacity;
+
+		while (nr < request_count) {
 			struct zram_wb_req *req;
 
-			req = alloc_wb_req(capacity);
+			req = alloc_wb_req(capacity, entries_size, bvecs_size);
 			if (!req)
 				break;
 			list_add_tail(&req->entry, &ctl->idle_reqs);
@@ -1075,6 +1148,7 @@ static struct zram_wb_ctl *init_wb_ctl(struct zram *zram)
 			ctl->capacity = capacity;
 			return ctl;
 		}
+reduce_capacity:
 		if (capacity == 1)
 			break;
 		capacity = rounddown_pow_of_two(capacity - 1);
@@ -1102,7 +1176,7 @@ static void release_wb_ctl(struct zram_wb_ctl *ctl)
 		list_del_init(&req->entry);
 		release_wb_req(req);
 	}
-	kfree_rcu(ctl, rcu);
+	kfree(ctl);
 }
 
 static void zram_writeback_endio(struct bio *bio)
@@ -1596,9 +1670,14 @@ zram_select_idle_req(struct zram *zram, struct zram_wb_ctl *ctl,
 {
 	struct zram_wb_req *req;
 
-	while (list_empty(&ctl->idle_reqs)) {
+	for (;;) {
+		if (zram_done_reqs_available(ctl))
+			zram_complete_done_reqs(zram, ctl, io_error);
+		if (*io_error)
+			return NULL;
+		if (!list_empty(&ctl->idle_reqs))
+			break;
 		wait_event(ctl->done_wait, zram_done_reqs_available(ctl));
-		zram_complete_done_reqs(zram, ctl, io_error);
 	}
 
 	req = list_first_entry(&ctl->idle_reqs, struct zram_wb_req, entry);
@@ -1711,6 +1790,8 @@ static ssize_t writeback_store(struct device *dev,
 		u32 run;
 
 		req = zram_select_idle_req(zram, wb_ctl, &io_error);
+		if (!req)
+			break;
 		goal = zram_writeback_goal(zram, req);
 		if (!goal) {
 			zram_put_idle_req(wb_ctl, req);
