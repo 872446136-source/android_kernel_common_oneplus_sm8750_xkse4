@@ -96,6 +96,8 @@ CONFIG_DAMON_LRU_SORT=y
 CONFIG_NET_SCH_CAKE=y
 CONFIG_CMDLINE="console=ttynull stack_depot_disable=on init_on_alloc=0 cgroup_disable=pressure kasan=off kfence.sample_interval=0 rcu_nocbs=all rcutree.enable_rcu_lazy=1 bootconfig ioremap_guard"
 CONFIG_CMDLINE_EXTEND=y
+
+# Default cmdline
 # CONFIG_CMDLINE="console=ttynull stack_depot_disable=on cgroup_disable=pressure kasan.stacktrace=off kvm-arm.mode=protected bootconfig ioremap_guard rcu_nocbs=all rcutree.enable_rcu_lazy=1"
 
 # EDIT15 -- passed
