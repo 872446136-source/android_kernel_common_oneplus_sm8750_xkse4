@@ -51,6 +51,7 @@ enum zram_pageflags {
 	ZRAM_SAME,	/* Page consists the same element */
 	ZRAM_WB,	/* page is stored on backing_device */
 	ZRAM_UNDER_WB,	/* page is under writeback */
+	ZRAM_PP_SLOT,	/* Selected for post-processing */
 	ZRAM_HUGE,	/* Incompressible page */
 	ZRAM_IDLE,	/* not accessed page since last idle marking */
 	ZRAM_INCOMPRESSIBLE, /* none of the algorithms could compress it */
@@ -143,6 +144,9 @@ struct zram {
 	 * zram is claimed so open request will be failed
 	 */
 	bool claim; /* Protected by disk->open_mutex */
+#if defined(CONFIG_ZRAM_WRITEBACK) || defined(CONFIG_ZRAM_MULTI_COMP)
+	atomic_t pp_in_progress;
+#endif
 #ifdef CONFIG_ZRAM_WRITEBACK
 	struct file *backing_dev;
 	struct mutex writeback_lock;
