@@ -305,13 +305,16 @@ direct_free:
 	}
 }
 
-swp_entry_t folio_alloc_swap(struct folio *folio)
+swp_entry_t folio_alloc_swap(struct folio *folio, int *error)
 {
 	swp_entry_t entry;
 	struct swap_slots_cache *cache;
+	long nr_swap_pages = get_nr_swap_pages();
 	bool bypass = false;
+	int ret;
 
 	entry.val = 0;
+	*error = 0;
 
 	trace_android_vh_folio_alloc_swap_bypass(&entry, folio, &bypass);
 	if (bypass)
@@ -352,9 +355,19 @@ repeat:
 
 	get_swap_pages(1, &entry, 0);
 out:
-	if (mem_cgroup_try_charge_swap(folio, entry)) {
+	ret = mem_cgroup_try_charge_swap(folio, entry, &nr_swap_pages);
+	if (ret) {
 		put_swap_folio(folio, entry);
 		entry.val = 0;
+		*error = folio_test_large(folio) && nr_swap_pages > 0 ?
+			 -E2BIG : ret;
+	} else if (!entry.val) {
+		if (get_nr_swap_pages() <= 0)
+			*error = -ENOSPC;
+		else if (folio_test_large(folio) && nr_swap_pages > 0)
+			*error = -E2BIG;
+		else
+			*error = -ENOMEM;
 	}
 	return entry;
 }

@@ -1456,6 +1456,7 @@ static int shmem_writepage(struct page *page, struct writeback_control *wbc)
 	struct shmem_inode_info *info = SHMEM_I(inode);
 	struct shmem_sb_info *sbinfo = SHMEM_SB(inode->i_sb);
 	swp_entry_t swap;
+	int error;
 	pgoff_t index;
 
 	/*
@@ -1471,7 +1472,7 @@ static int shmem_writepage(struct page *page, struct writeback_control *wbc)
 	if (WARN_ON_ONCE((info->flags & VM_LOCKED) || sbinfo->noswap))
 		goto redirty;
 
-	if (!total_swap_pages)
+	if (mem_cgroup_get_nr_swap_pages(folio_memcg(folio)) <= 0)
 		goto redirty;
 
 	/*
@@ -1522,7 +1523,7 @@ static int shmem_writepage(struct page *page, struct writeback_control *wbc)
 		folio_mark_uptodate(folio);
 	}
 
-	swap = folio_alloc_swap(folio);
+	swap = folio_alloc_swap(folio, &error);
 	if (!swap.val)
 		goto redirty;
 

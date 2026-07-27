@@ -7779,12 +7779,14 @@ void mem_cgroup_swapout(struct folio *folio, swp_entry_t entry)
  * __mem_cgroup_try_charge_swap - try charging swap space for a folio
  * @folio: folio being added to swap
  * @entry: swap entry to charge
+ * @nr_swap_pages: optional swap availability to cap by memcg margin
  *
  * Try to charge @folio's memcg for the swap space at @entry.
  *
  * Returns 0 on success, -ENOMEM on failure.
  */
-int __mem_cgroup_try_charge_swap(struct folio *folio, swp_entry_t entry)
+int __mem_cgroup_try_charge_swap(struct folio *folio, swp_entry_t entry,
+				 long *nr_swap_pages)
 {
 	unsigned int nr_pages = folio_nr_pages(folio);
 	struct page_counter *counter;
@@ -7801,6 +7803,9 @@ int __mem_cgroup_try_charge_swap(struct folio *folio, swp_entry_t entry)
 		return 0;
 
 	if (!entry.val) {
+		if (nr_swap_pages && !mem_cgroup_is_root(memcg))
+			*nr_swap_pages = min(*nr_swap_pages,
+					     page_counter_margin(&memcg->swap));
 		memcg_memory_event(memcg, MEMCG_SWAP_FAIL);
 		return 0;
 	}
@@ -7812,6 +7817,9 @@ int __mem_cgroup_try_charge_swap(struct folio *folio, swp_entry_t entry)
 		memcg_memory_event(memcg, MEMCG_SWAP_MAX);
 		memcg_memory_event(memcg, MEMCG_SWAP_FAIL);
 		mem_cgroup_id_put(memcg);
+		if (nr_swap_pages)
+			*nr_swap_pages = min(*nr_swap_pages,
+					     page_counter_margin(counter));
 		return -ENOMEM;
 	}
 
@@ -7857,10 +7865,8 @@ long mem_cgroup_get_nr_swap_pages(struct mem_cgroup *memcg)
 
 	if (mem_cgroup_disabled() || do_memsw_account())
 		return nr_swap_pages;
-	for (; !mem_cgroup_is_root(memcg); memcg = parent_mem_cgroup(memcg))
-		nr_swap_pages = min_t(long, nr_swap_pages,
-				      READ_ONCE(memcg->swap.max) -
-				      page_counter_read(&memcg->swap));
+	nr_swap_pages = min(nr_swap_pages,
+			    page_counter_margin(&memcg->swap));
 	return nr_swap_pages;
 }
 

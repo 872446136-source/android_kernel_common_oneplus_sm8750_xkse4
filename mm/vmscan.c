@@ -2037,6 +2037,8 @@ retry:
 		 */
 		if (folio_test_anon(folio) && folio_test_swapbacked(folio)) {
 			if (!folio_test_swapcache(folio)) {
+				int ret;
+
 				if (!(sc->gfp_mask & __GFP_IO))
 					goto keep_locked;
 				if (folio_maybe_dma_pinned(folio))
@@ -2051,11 +2053,12 @@ retry:
 				    (data_race(!list_empty(&folio->_deferred_list)) ||
 				    should_split_to_list))
 					split_folio_to_list(folio, folio_list);
-				if (!add_to_swap(folio)) {
+				ret = add_to_swap(folio);
+				if (ret) {
 					int __maybe_unused order = folio_order(folio);
 					bool bypass = false;
 
-					if (!folio_test_large(folio))
+					if (!folio_test_large(folio) || ret != -E2BIG)
 						goto activate_locked_split;
 					trace_android_vh_split_large_folio_bypass(&bypass);
 					if (bypass)
@@ -2070,7 +2073,7 @@ retry:
 					}
 					count_mthp_stat(order, MTHP_STAT_SWPOUT_FALLBACK);
 #endif
-					if (!add_to_swap(folio))
+					if (add_to_swap(folio))
 						goto activate_locked_split;
 				}
 			}
