@@ -101,9 +101,9 @@ struct zram_stats {
 	atomic64_t bd_count;		/* no. of pages in backing device */
 	atomic64_t bd_reads;		/* no. of reads from backing device */
 	atomic64_t bd_writes;		/* no. of writes to backing device */
-	atomic64_t wb_batches;		/* contiguous multi-page writeback I/O */
-	atomic64_t wb_batch_pages;	/* pages submitted through batches */
-	atomic64_t wb_batch_fallbacks;	/* fragmented backing fallback count */
+	atomic64_t wb_batches;		/* successful multi-page writeback BIOs */
+	atomic64_t wb_batch_pages;	/* pages in successful multi-page BIOs */
+	atomic64_t wb_batch_fallbacks;	/* downgraded BIO submissions */
 	atomic64_t wb_alloc_failures;	/* backing block allocation failures */
 	atomic64_t wb_io_errors;	/* backing write I/O failures */
 #endif
@@ -153,6 +153,7 @@ struct zram {
 	bool compressed_wb;
 	u64 bd_wb_limit;
 	u32 wb_batch_size;
+	u32 wb_bio_pages;
 	struct block_device *bdev;
 	unsigned long *bitmap;
 	unsigned long nr_pages;
