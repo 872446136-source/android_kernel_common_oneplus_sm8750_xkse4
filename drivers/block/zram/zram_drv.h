@@ -18,6 +18,7 @@
 #include <linux/mutex.h>
 #include <linux/rwsem.h>
 #include <linux/lockdep.h>
+#include <linux/wait.h>
 #include <linux/zsmalloc.h>
 
 #include "zcomp.h"
@@ -149,6 +150,7 @@ struct zram {
 #ifdef CONFIG_ZRAM_WRITEBACK
 	struct file *backing_dev;
 	bool wb_limit_enable;
+	bool compressed_wb;
 	u64 bd_wb_limit;
 	u32 wb_batch_size;
 	struct block_device *bdev;
@@ -156,6 +158,8 @@ struct zram {
 	unsigned long nr_pages;
 	spinlock_t bitmap_lock;
 	unsigned long wb_next_block;
+	atomic_t rb_inflight;
+	wait_queue_head_t rb_wait;
 #endif
 #ifdef CONFIG_ZRAM_MEMORY_TRACKING
 	struct dentry *debugfs_dir;
