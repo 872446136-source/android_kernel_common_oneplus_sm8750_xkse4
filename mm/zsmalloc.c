@@ -1287,6 +1287,158 @@ void zs_unmap_object(struct zs_pool *pool, unsigned long handle)
 }
 EXPORT_SYMBOL_GPL(zs_unmap_object);
 
+static bool zs_obj_lock(struct zs_pool *pool, unsigned long handle,
+			size_t size, struct page **page,
+			struct zspage **zspage, unsigned long *off)
+{
+	unsigned long obj;
+	unsigned int obj_idx;
+	struct size_class *class;
+	size_t object_size;
+
+	if (IS_ERR_OR_NULL((void *)handle) || !size)
+		return false;
+
+	/* Guarantee that the handle location remains stable while resolving it. */
+	spin_lock(&pool->lock);
+	obj = handle_to_obj(handle);
+	obj_to_location(obj, page, &obj_idx);
+	*zspage = get_zspage(*page);
+
+	/* Prevent migration of every physical page backing this object. */
+	migrate_read_lock(*zspage);
+	spin_unlock(&pool->lock);
+
+	class = zspage_class(pool, *zspage);
+	*off = offset_in_page(class->size * obj_idx);
+	object_size = class->size;
+	if (likely(!ZsHugePage(*zspage))) {
+		*off += ZS_HANDLE_SIZE;
+		object_size -= ZS_HANDLE_SIZE;
+	}
+
+	if (unlikely(size > object_size)) {
+		migrate_read_unlock(*zspage);
+		return false;
+	}
+
+	return true;
+}
+
+/*
+ * Return a stable, contiguous view of an object. Cross-page objects are
+ * copied into local_copy; callers must pair success with zs_obj_read_end().
+ */
+void *zs_obj_read_begin(struct zs_pool *pool, unsigned long handle,
+			size_t size, void *local_copy)
+{
+	struct zspage *zspage;
+	struct page *page, *next;
+	unsigned long off;
+	void *addr;
+	size_t first_size;
+
+	if (!zs_obj_lock(pool, handle, size, &page, &zspage, &off))
+		return NULL;
+
+	if (off + size <= PAGE_SIZE) {
+		addr = kmap_atomic(page);
+		return addr + off;
+	}
+
+	if (!local_copy)
+		goto unlock;
+
+	next = get_next_page(page);
+	if (unlikely(!next))
+		goto unlock;
+
+	first_size = PAGE_SIZE - off;
+	addr = kmap_atomic(page);
+	memcpy(local_copy, addr + off, first_size);
+	kunmap_atomic(addr);
+	addr = kmap_atomic(next);
+	memcpy(local_copy + first_size, addr, size - first_size);
+	kunmap_atomic(addr);
+
+	return local_copy;
+
+unlock:
+	migrate_read_unlock(zspage);
+	return NULL;
+}
+EXPORT_SYMBOL_GPL(zs_obj_read_begin);
+
+void zs_obj_read_end(struct zs_pool *pool, unsigned long handle,
+			size_t size, void *handle_mem)
+{
+	struct zspage *zspage;
+	struct page *page;
+	unsigned long obj, off;
+	unsigned int obj_idx;
+	struct size_class *class;
+
+	if (WARN_ON_ONCE(IS_ERR_OR_NULL((void *)handle) || !size ||
+			 !handle_mem))
+		return;
+
+	obj = handle_to_obj(handle);
+	obj_to_location(obj, &page, &obj_idx);
+	zspage = get_zspage(page);
+	class = zspage_class(pool, zspage);
+	off = offset_in_page(class->size * obj_idx);
+	if (likely(!ZsHugePage(zspage)))
+		off += ZS_HANDLE_SIZE;
+
+	if (off + size <= PAGE_SIZE)
+		kunmap_atomic(handle_mem - off);
+
+	migrate_read_unlock(zspage);
+}
+EXPORT_SYMBOL_GPL(zs_obj_read_end);
+
+/* Copy exactly size bytes from a contiguous buffer into an object. */
+int zs_obj_write(struct zs_pool *pool, unsigned long handle,
+		 const void *handle_mem, size_t size)
+{
+	struct zspage *zspage;
+	struct page *page, *next;
+	unsigned long off;
+	const char *src = handle_mem;
+	void *addr;
+	size_t first_size;
+	int ret = 0;
+
+	if (!handle_mem ||
+	    !zs_obj_lock(pool, handle, size, &page, &zspage, &off))
+		return -EINVAL;
+
+	if (off + size <= PAGE_SIZE) {
+		addr = kmap_atomic(page);
+		memcpy(addr + off, src, size);
+		kunmap_atomic(addr);
+		goto out;
+	}
+
+	next = get_next_page(page);
+	if (unlikely(!next)) {
+		ret = -EINVAL;
+		goto out;
+	}
+
+	first_size = PAGE_SIZE - off;
+	addr = kmap_atomic(page);
+	memcpy(addr + off, src, first_size);
+	kunmap_atomic(addr);
+	addr = kmap_atomic(next);
+	memcpy(addr, src + first_size, size - first_size);
+	kunmap_atomic(addr);
+out:
+	migrate_read_unlock(zspage);
+	return ret;
+}
+EXPORT_SYMBOL_GPL(zs_obj_write);
+
 /**
  * zs_huge_class_size() - Returns the size (in bytes) of the first huge
  *                        zsmalloc &size_class.
@@ -1831,7 +1983,7 @@ static int zs_page_migrate(struct page *newpage, struct page *page,
 	spin_lock(&pool->lock);
 	class = zspage_class(pool, zspage);
 
-	/* the migrate_write_lock protects zpage access via zs_map_object */
+	/* migrate_write_lock protects zspage object accessors from migration */
 	migrate_write_lock(zspage);
 
 	offset = get_first_obj_offset(page);

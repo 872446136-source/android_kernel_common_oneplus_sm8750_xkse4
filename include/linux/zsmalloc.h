@@ -52,6 +52,13 @@ void *zs_map_object(struct zs_pool *pool, unsigned long handle,
 			enum zs_mapmode mm);
 void zs_unmap_object(struct zs_pool *pool, unsigned long handle);
 
+void *zs_obj_read_begin(struct zs_pool *pool, unsigned long handle,
+			size_t size, void *local_copy);
+void zs_obj_read_end(struct zs_pool *pool, unsigned long handle,
+			size_t size, void *handle_mem);
+int zs_obj_write(struct zs_pool *pool, unsigned long handle,
+		 const void *handle_mem, size_t size);
+
 unsigned long zs_get_total_pages(struct zs_pool *pool);
 unsigned long zs_compact(struct zs_pool *pool);
 

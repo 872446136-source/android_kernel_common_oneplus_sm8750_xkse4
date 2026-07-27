@@ -17,6 +17,7 @@
 
 #include <linux/mutex.h>
 #include <linux/rwsem.h>
+#include <linux/lockdep.h>
 #include <linux/zsmalloc.h>
 #include <linux/crypto.h>
 
@@ -44,7 +45,7 @@
 /* Only 2 bits are allowed for comp priority index */
 #define ZRAM_COMP_PRIORITY_MASK	0x3
 
-/* Flags for zram pages (table[page_no].flags) */
+/* Flags for zram pages (table[page_no].attr.flags) */
 enum zram_pageflags {
 	/* zram slot is locked */
 	ZRAM_LOCK = ZRAM_FLAG_SHIFT,
@@ -63,16 +64,25 @@ enum zram_pageflags {
 
 /*-- Data structures */
 
-/* Allocated for each disk page */
+/*
+ * Allocated for each disk page. The entry lock shares storage with flags
+ * (and access time, when enabled) to keep the per-slot footprint compact.
+ */
 struct zram_table_entry {
 	union {
 		unsigned long handle;
 		unsigned long element;
 	};
-	unsigned long flags;
+	union {
+		unsigned long __lock;
+		struct {
+			u32 flags;
 #ifdef CONFIG_ZRAM_TRACK_ENTRY_ACTIME
-	ktime_t ac_time;
+			u32 ac_time;
 #endif
+		} attr;
+	};
+	struct lockdep_map dep_map;
 };
 
 struct zram_stats {
