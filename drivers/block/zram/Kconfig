@@ -148,20 +148,6 @@ config ZRAM_WRITEBACK
 
 	 See Documentation/admin-guide/blockdev/zram.rst for more information.
 
-config ZRAM_WRITEBACK_BATCH
-	bool "Batch contiguous zram writeback I/O"
-	depends on ZRAM_WRITEBACK
-	default y
-	help
-	  Batch up to eight eligible zram pages into one contiguous backing-device
-	  I/O.  The implementation keeps the standard page-granular zram backing
-	  format and falls back to single-page I/O when a contiguous backing run
-	  cannot be allocated.
-
-	  This is intentionally smaller and less invasive than an object-packing
-	  store: zram slot format, read semantics, writeback ABI and reset behavior
-	  remain unchanged.
-
 config ZRAM_TRACK_ENTRY_ACTIME
 	bool "Track access time of zram entries"
 	depends on ZRAM
