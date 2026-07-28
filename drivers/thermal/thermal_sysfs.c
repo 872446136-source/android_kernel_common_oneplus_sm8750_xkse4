@@ -18,6 +18,7 @@
 #include <linux/slab.h>
 #include <linux/string.h>
 #include <linux/jiffies.h>
+#include <linux/thermal_offset.h>
 #include <trace/hooks/thermal.h>
 
 #include "thermal_core.h"
@@ -48,6 +49,32 @@ temp_show(struct device *dev, struct device_attribute *attr, char *buf)
 
 	return ret;
 }
+
+#ifdef CONFIG_TEMP_OFFSET
+static ssize_t
+temp_raw_show(struct device *dev, struct device_attribute *attr, char *buf)
+{
+	struct thermal_zone_device *tz = to_thermal_zone(dev);
+	int temperature, ret;
+
+	mutex_lock(&tz->lock);
+
+	if (device_is_registered(dev))
+		ret = thermal_runtime_offset_get_raw_temp(tz, &temperature);
+	else
+		ret = -ENODEV;
+
+	mutex_unlock(&tz->lock);
+
+	if (!ret)
+		return sysfs_emit(buf, "%d\n", temperature);
+
+	if (ret == -EAGAIN)
+		return -ENODATA;
+
+	return ret;
+}
+#endif
 
 static ssize_t
 mode_show(struct device *dev, struct device_attribute *attr, char *buf)
@@ -272,8 +299,10 @@ emul_temp_store(struct device *dev, struct device_attribute *attr,
 		const char *buf, size_t count)
 {
 	struct thermal_zone_device *tz = to_thermal_zone(dev);
+	enum thermal_runtime_offset_domain domain;
 	int ret = 0;
 	int temperature;
+	int raw_temperature;
 
 	if (kstrtoint(buf, 10, &temperature))
 		return -EINVAL;
@@ -287,8 +316,18 @@ emul_temp_store(struct device *dev, struct device_attribute *attr,
 
 	if (!tz->ops->set_emul_temp)
 		tz->emul_temperature = temperature;
-	else
-		ret = tz->ops->set_emul_temp(tz, temperature);
+	else {
+		raw_temperature = temperature;
+		if (temperature) {
+			domain = thermal_runtime_offset_domain_for_type(tz->type);
+			ret = thermal_runtime_offset_to_raw(domain, temperature,
+							    &raw_temperature);
+			if (ret)
+				goto unlock;
+		}
+
+		ret = tz->ops->set_emul_temp(tz, raw_temperature);
+	}
 
 	if (!ret)
 		__thermal_zone_device_update(tz, THERMAL_EVENT_UNSPECIFIED);
@@ -379,6 +418,9 @@ create_s32_tzp_attr(offset);
  */
 static DEVICE_ATTR_RO(type);
 static DEVICE_ATTR_RO(temp);
+#ifdef CONFIG_TEMP_OFFSET
+static DEVICE_ATTR_RO(temp_raw);
+#endif
 static DEVICE_ATTR_RW(policy);
 static DEVICE_ATTR_RO(available_policies);
 static DEVICE_ATTR_RW(sustainable_power);
@@ -410,6 +452,31 @@ static const struct attribute_group thermal_zone_attribute_group = {
 	.attrs = thermal_zone_dev_attrs,
 };
 
+#ifdef CONFIG_TEMP_OFFSET
+static struct attribute *thermal_zone_raw_temp_attrs[] = {
+	&dev_attr_temp_raw.attr,
+	NULL,
+};
+
+static umode_t thermal_zone_raw_temp_is_visible(struct kobject *kobj,
+						struct attribute *attr,
+						int attrno)
+{
+	struct thermal_zone_device *tz = to_thermal_zone(kobj_to_dev(kobj));
+
+	if (thermal_runtime_offset_domain_for_type(tz->type) ==
+	    THERMAL_RUNTIME_OFFSET_NONE)
+		return 0;
+
+	return attr->mode;
+}
+
+static const struct attribute_group thermal_zone_raw_temp_attribute_group = {
+	.attrs = thermal_zone_raw_temp_attrs,
+	.is_visible = thermal_zone_raw_temp_is_visible,
+};
+#endif
+
 static struct attribute *thermal_zone_mode_attrs[] = {
 	&dev_attr_mode.attr,
 	NULL,
@@ -422,6 +489,9 @@ static const struct attribute_group thermal_zone_mode_attribute_group = {
 static const struct attribute_group *thermal_zone_attribute_groups[] = {
 	&thermal_zone_attribute_group,
 	&thermal_zone_mode_attribute_group,
+#ifdef CONFIG_TEMP_OFFSET
+	&thermal_zone_raw_temp_attribute_group,
+#endif
 	/* This is not NULL terminated as we create the group dynamically */
 };
 

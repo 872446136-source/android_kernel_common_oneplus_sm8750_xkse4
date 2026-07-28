@@ -18,9 +18,11 @@
 #include <linux/notifier.h>
 #include <linux/err.h>
 #include <linux/of.h>
+#include <linux/overflow.h>
 #include <linux/power_supply.h>
 #include <linux/property.h>
 #include <linux/thermal.h>
+#include <linux/thermal_offset.h>
 #include <linux/fixp-arith.h>
 #include "power_supply.h"
 #include "samsung-sdi-battery.h"
@@ -1272,9 +1274,9 @@ static bool psy_has_property(const struct power_supply_desc *psy_desc,
 	return found;
 }
 
-int power_supply_get_property(struct power_supply *psy,
-			    enum power_supply_property psp,
-			    union power_supply_propval *val)
+static int __power_supply_get_property(struct power_supply *psy,
+				       enum power_supply_property psp,
+				       union power_supply_propval *val)
 {
 	if (atomic_read(&psy->use_cnt) <= 0) {
 		if (!psy->initialized)
@@ -1288,6 +1290,43 @@ int power_supply_get_property(struct power_supply *psy,
 		return power_supply_battery_info_get_prop(psy->battery_info, psp, val);
 	else
 		return -EINVAL;
+}
+
+#if IS_ENABLED(CONFIG_TEMP_OFFSET)
+int power_supply_get_property_raw(struct power_supply *psy,
+				  enum power_supply_property psp,
+				  union power_supply_propval *val)
+{
+	return __power_supply_get_property(psy, psp, val);
+}
+#endif
+
+int power_supply_get_property(struct power_supply *psy,
+			    enum power_supply_property psp,
+			    union power_supply_propval *val)
+{
+	int ret;
+
+	ret = __power_supply_get_property(psy, psp, val);
+	if (ret)
+		return ret;
+
+#if IS_ENABLED(CONFIG_TEMP_OFFSET)
+	if (psp == POWER_SUPPLY_PROP_TEMP &&
+	    thermal_runtime_offset_is_battery_supply(psy)) {
+		int temperature;
+		int offset;
+
+		offset = thermal_runtime_offset_get_mc(
+				THERMAL_RUNTIME_OFFSET_BATTERY) / 100;
+		if (check_add_overflow(val->intval, offset, &temperature))
+			return -EOVERFLOW;
+
+		val->intval = temperature;
+	}
+#endif
+
+	return 0;
 }
 EXPORT_SYMBOL_GPL(power_supply_get_property);
 
@@ -1363,6 +1402,17 @@ static int power_supply_read_temp(struct thermal_zone_device *tzd,
 		return ret;
 
 	/* Convert tenths of degree Celsius to milli degree Celsius. */
+#if IS_ENABLED(CONFIG_TEMP_OFFSET)
+	if (thermal_runtime_offset_is_battery_supply(psy)) {
+		int temperature;
+
+		if (check_mul_overflow(val.intval, 100, &temperature))
+			return -EOVERFLOW;
+
+		*temp = temperature;
+		return 0;
+	}
+#endif
 	*temp = val.intval * 100;
 
 	return ret;

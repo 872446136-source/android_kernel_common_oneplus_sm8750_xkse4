@@ -15,6 +15,7 @@
 #include <linux/power_supply.h>
 #include <linux/slab.h>
 #include <linux/stat.h>
+#include <linux/thermal_offset.h>
 
 #include "power_supply.h"
 
@@ -389,6 +390,45 @@ static umode_t power_supply_attr_is_visible(struct kobject *kobj,
 	return 0;
 }
 
+#if IS_ENABLED(CONFIG_TEMP_OFFSET)
+static ssize_t temp_raw_show(struct device *dev,
+			     struct device_attribute *attr, char *buf)
+{
+	struct power_supply *psy = dev_get_drvdata(dev);
+	union power_supply_propval value;
+	int ret;
+
+	ret = power_supply_get_property_raw(psy, POWER_SUPPLY_PROP_TEMP, &value);
+	if (ret)
+		return ret;
+
+	return sysfs_emit(buf, "%d\n", value.intval);
+}
+static DEVICE_ATTR_RO(temp_raw);
+
+static struct attribute *power_supply_temp_raw_attrs[] = {
+	&dev_attr_temp_raw.attr,
+	NULL,
+};
+
+static umode_t power_supply_temp_raw_is_visible(struct kobject *kobj,
+						struct attribute *attr,
+						int attrno)
+{
+	struct power_supply *psy = dev_get_drvdata(kobj_to_dev(kobj));
+
+	if (!thermal_runtime_offset_is_battery_supply(psy))
+		return 0;
+
+	return attr->mode;
+}
+
+static const struct attribute_group power_supply_temp_raw_attr_group = {
+	.attrs = power_supply_temp_raw_attrs,
+	.is_visible = power_supply_temp_raw_is_visible,
+};
+#endif
+
 static const struct attribute_group power_supply_attr_group = {
 	.attrs = __power_supply_attrs,
 	.is_visible = power_supply_attr_is_visible,
@@ -396,6 +436,9 @@ static const struct attribute_group power_supply_attr_group = {
 
 static const struct attribute_group *power_supply_attr_groups[] = {
 	&power_supply_attr_group,
+#if IS_ENABLED(CONFIG_TEMP_OFFSET)
+	&power_supply_temp_raw_attr_group,
+#endif
 	NULL,
 };
 

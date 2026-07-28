@@ -17,6 +17,11 @@ menuconfig THERMAL
 
 if THERMAL
 
+config TEMP_OFFSET
+	bool "Runtime multi-domain temperature offsets"
+	depends on THERMAL && SYSCTL && POWER_SUPPLY
+	default n
+
 config THERMAL_NETLINK
 	bool "Thermal netlink management"
 	depends on NET

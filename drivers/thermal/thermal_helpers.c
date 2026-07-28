@@ -18,6 +18,7 @@
 #include <linux/slab.h>
 #include <linux/string.h>
 #include <linux/sysfs.h>
+#include <linux/thermal_offset.h>
 
 #include "thermal_core.h"
 #include "thermal_trace.h"
@@ -83,6 +84,7 @@ EXPORT_SYMBOL(get_thermal_instance);
  */
 int __thermal_zone_get_temp(struct thermal_zone_device *tz, int *temp)
 {
+	enum thermal_runtime_offset_domain domain;
 	int ret = -EINVAL;
 	int count;
 	int crit_temp = INT_MAX;
@@ -91,6 +93,15 @@ int __thermal_zone_get_temp(struct thermal_zone_device *tz, int *temp)
 	lockdep_assert_held(&tz->lock);
 
 	ret = tz->ops->get_temp(tz, temp);
+	if (!ret) {
+		domain = thermal_runtime_offset_domain_for_type(tz->type);
+		if (domain != THERMAL_RUNTIME_OFFSET_NONE &&
+		    domain != THERMAL_RUNTIME_OFFSET_BATTERY) {
+			ret = thermal_runtime_offset_apply(domain, *temp, temp);
+			if (ret)
+				goto out;
+		}
+	}
 
 	if (IS_ENABLED(CONFIG_THERMAL_EMULATION) && tz->emul_temperature) {
 		for (count = 0; count < tz->num_trips; count++) {
@@ -110,6 +121,7 @@ int __thermal_zone_get_temp(struct thermal_zone_device *tz, int *temp)
 			*temp = tz->emul_temperature;
 	}
 
+out:
 	if (ret)
 		dev_dbg(&tz->device, "Failed to get temperature: %d\n", ret);
 

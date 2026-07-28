@@ -7,6 +7,8 @@
  *
  * Thermal trips handling
  */
+#include <linux/thermal_offset.h>
+
 #include "thermal_core.h"
 
 int for_each_thermal_trip(struct thermal_zone_device *tz,
@@ -50,8 +52,10 @@ EXPORT_SYMBOL_GPL(thermal_zone_get_num_trips);
  */
 void __thermal_zone_set_trips(struct thermal_zone_device *tz)
 {
+	enum thermal_runtime_offset_domain domain;
 	struct thermal_trip trip;
 	int low = -INT_MAX, high = INT_MAX;
+	int raw_low, raw_high;
 	int i, ret;
 
 	lockdep_assert_held(&tz->lock);
@@ -80,6 +84,15 @@ void __thermal_zone_set_trips(struct thermal_zone_device *tz)
 	if (tz->prev_low_trip == low && tz->prev_high_trip == high)
 		return;
 
+	domain = thermal_runtime_offset_domain_for_type(tz->type);
+	ret = thermal_runtime_offset_to_raw(domain, low, &raw_low);
+	if (ret)
+		goto conversion_failed;
+
+	ret = thermal_runtime_offset_to_raw(domain, high, &raw_high);
+	if (ret)
+		goto conversion_failed;
+
 	tz->prev_low_trip = low;
 	tz->prev_high_trip = high;
 
@@ -90,9 +103,15 @@ void __thermal_zone_set_trips(struct thermal_zone_device *tz)
 	 * Set a temperature window. When this window is left the driver
 	 * must inform the thermal core via thermal_zone_device_update.
 	 */
-	ret = tz->ops->set_trips(tz, low, high);
+	ret = tz->ops->set_trips(tz, raw_low, raw_high);
 	if (ret)
 		dev_err(&tz->device, "Failed to set trips: %d\n", ret);
+
+	return;
+
+conversion_failed:
+	dev_err(&tz->device, "Failed to convert trip temperatures: %d\n",
+		ret);
 }
 
 int __thermal_zone_get_trip(struct thermal_zone_device *tz, int trip_id,
@@ -122,7 +141,9 @@ EXPORT_SYMBOL_GPL(thermal_zone_get_trip);
 int thermal_zone_set_trip(struct thermal_zone_device *tz, int trip_id,
 			  const struct thermal_trip *trip)
 {
+	enum thermal_runtime_offset_domain domain;
 	struct thermal_trip t;
+	int raw_temp;
 	int ret;
 
 	if (!tz->ops->set_trip_temp && !tz->ops->set_trip_hyst && !tz->trips)
@@ -136,7 +157,13 @@ int thermal_zone_set_trip(struct thermal_zone_device *tz, int trip_id,
 		return -EINVAL;
 
 	if (t.temperature != trip->temperature && tz->ops->set_trip_temp) {
-		ret = tz->ops->set_trip_temp(tz, trip_id, trip->temperature);
+		domain = thermal_runtime_offset_domain_for_type(tz->type);
+		ret = thermal_runtime_offset_to_raw(domain, trip->temperature,
+						    &raw_temp);
+		if (ret)
+			return ret;
+
+		ret = tz->ops->set_trip_temp(tz, trip_id, raw_temp);
 		if (ret)
 			return ret;
 	}
