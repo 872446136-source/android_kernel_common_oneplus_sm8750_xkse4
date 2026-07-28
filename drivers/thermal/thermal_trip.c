@@ -7,6 +7,7 @@
  *
  * Thermal trips handling
  */
+#include <linux/overflow.h>
 #include <linux/thermal_offset.h>
 
 #include "thermal_core.h"
@@ -70,7 +71,16 @@ void __thermal_zone_set_trips(struct thermal_zone_device *tz)
 		if (ret)
 			return;
 
-		trip_low = trip.temperature - trip.hysteresis;
+		if (trip.temperature == INT_MAX ||
+		    trip.temperature == -INT_MAX ||
+		    trip.temperature == THERMAL_TEMP_INVALID) {
+			trip_low = trip.temperature;
+		} else if (check_sub_overflow(trip.temperature,
+					      trip.hysteresis, &trip_low)) {
+			dev_err(&tz->device,
+				"Failed to calculate low trip temperature\n");
+			return;
+		}
 
 		if (trip_low < tz->temperature && trip_low > low)
 			low = trip_low;
