@@ -50,6 +50,7 @@
 #include <linux/sched/mm.h>
 #include <linux/sched/coredump.h>
 #include <linux/sched/cputime.h>
+#include <linux/sched/topology.h>
 #include <linux/rwsem.h>
 #include <linux/pagemap.h>
 #include <linux/rmap.h>
@@ -4516,7 +4517,7 @@ static noinline void uksm_calc_scan_pages(void)
 	 * based on saved user input.
 	 */
 	if (((unsigned long) uksm_eval_round & (8UL - 1)) == 0UL)
-		uksm_sleep_jiffies = uksm_sleep_saved;
+		WRITE_ONCE(uksm_sleep_jiffies, uksm_sleep_saved);
 
 	/* We require a rung scan at least 1 page in a period. */
 	nsecs = per_page;
@@ -4524,7 +4525,8 @@ static noinline void uksm_calc_scan_pages(void)
 	if (cpu_ratio_to_nsec(ratio) < nsecs) {
 		sleep_usecs = nsecs * (TIME_RATIO_SCALE - ratio) / ratio
 				/ NSEC_PER_USEC;
-		uksm_sleep_jiffies = usecs_to_jiffies(sleep_usecs) + 1;
+		WRITE_ONCE(uksm_sleep_jiffies,
+			   usecs_to_jiffies(sleep_usecs) + 1);
 	}
 
 	for (i = 0; i < SCAN_LADDER_SIZE; i++) {
@@ -4893,7 +4895,7 @@ rm_slot:
 
 static int ksmd_should_run(void)
 {
-	return (uksm_run & UKSM_RUN_MERGE) && check_game_pid();
+	return (READ_ONCE(uksm_run) & UKSM_RUN_MERGE) && check_game_pid();
 }
 
 static int uksm_scan_thread(void *nothing)
@@ -5086,7 +5088,7 @@ static int uksm_memory_callback(struct notifier_block *self,
 static ssize_t max_cpu_percentage_show(struct kobject *kobj,
 				    struct kobj_attribute *attr, char *buf)
 {
-	return sprintf(buf, "%u\n", uksm_max_cpu_percentage);
+	return sprintf(buf, "%u\n", READ_ONCE(uksm_max_cpu_percentage));
 }
 
 static ssize_t max_cpu_percentage_store(struct kobject *kobj,
@@ -5105,7 +5107,9 @@ static ssize_t max_cpu_percentage_store(struct kobject *kobj,
 	else if (max_cpu_percentage < 1)
 		max_cpu_percentage = 1;
 
-	uksm_max_cpu_percentage = max_cpu_percentage;
+	mutex_lock(&uksm_thread_mutex);
+	WRITE_ONCE(uksm_max_cpu_percentage, max_cpu_percentage);
+	mutex_unlock(&uksm_thread_mutex);
 
 	return count;
 }
@@ -5114,7 +5118,8 @@ UKSM_ATTR(max_cpu_percentage);
 static ssize_t sleep_millisecs_show(struct kobject *kobj,
 				    struct kobj_attribute *attr, char *buf)
 {
-	return sprintf(buf, "%u\n", jiffies_to_msecs(uksm_sleep_jiffies));
+	return sprintf(buf, "%u\n",
+		       jiffies_to_msecs(READ_ONCE(uksm_sleep_jiffies)));
 }
 
 static ssize_t sleep_millisecs_store(struct kobject *kobj,
@@ -5122,14 +5127,19 @@ static ssize_t sleep_millisecs_store(struct kobject *kobj,
 				     const char *buf, size_t count)
 {
 	unsigned long msecs;
+	unsigned int sleep_jiffies;
 	int err;
 
 	err = kstrtoul(buf, 10, &msecs);
 	if (err || msecs > MSEC_PER_SEC * 180)
 		return -EINVAL;
 
-	uksm_sleep_jiffies = msecs_to_jiffies(msecs);
-	uksm_sleep_saved = uksm_sleep_jiffies;
+	sleep_jiffies = msecs_to_jiffies(msecs);
+
+	mutex_lock(&uksm_thread_mutex);
+	WRITE_ONCE(uksm_sleep_jiffies, sleep_jiffies);
+	WRITE_ONCE(uksm_sleep_saved, sleep_jiffies);
+	mutex_unlock(&uksm_thread_mutex);
 
 	return count;
 }
@@ -5140,16 +5150,17 @@ static ssize_t cpu_governor_show(struct kobject *kobj,
 				  struct kobj_attribute *attr, char *buf)
 {
 	int n = sizeof(uksm_cpu_governor_str) / sizeof(char *);
+	int governor = READ_ONCE(uksm_cpu_governor);
 	int i;
 
 	buf[0] = '\0';
 	for (i = 0; i < n ; i++) {
-		if (uksm_cpu_governor == i)
+		if (governor == i)
 			strcat(buf, "[");
 
 		strcat(buf, uksm_cpu_governor_str[i]);
 
-		if (uksm_cpu_governor == i)
+		if (governor == i)
 			strcat(buf, "]");
 
 		strcat(buf, " ");
@@ -5163,16 +5174,17 @@ static inline void init_performance_values(void)
 {
 	int i;
 	struct scan_rung *rung;
-	struct uksm_cpu_preset_s *preset = uksm_cpu_preset + uksm_cpu_governor;
+	struct uksm_cpu_preset_s *preset =
+		uksm_cpu_preset + READ_ONCE(uksm_cpu_governor);
 
 
 	for (i = 0; i < SCAN_LADDER_SIZE; i++) {
 		rung = uksm_scan_ladder + i;
-		rung->cpu_ratio = preset->cpu_ratio[i];
-		rung->cover_msecs = preset->cover_msecs[i];
+		WRITE_ONCE(rung->cpu_ratio, preset->cpu_ratio[i]);
+		WRITE_ONCE(rung->cover_msecs, preset->cover_msecs[i]);
 	}
 
-	uksm_max_cpu_percentage = preset->max_cpu;
+	WRITE_ONCE(uksm_max_cpu_percentage, preset->max_cpu);
 }
 
 static ssize_t cpu_governor_store(struct kobject *kobj,
@@ -5189,10 +5201,11 @@ static ssize_t cpu_governor_store(struct kobject *kobj,
 
 	if (n < 0)
 		return -EINVAL;
-	else
-		uksm_cpu_governor = n;
 
+	mutex_lock(&uksm_thread_mutex);
+	WRITE_ONCE(uksm_cpu_governor, n);
 	init_performance_values();
+	mutex_unlock(&uksm_thread_mutex);
 
 	return count;
 }
@@ -5201,7 +5214,7 @@ UKSM_ATTR(cpu_governor);
 static ssize_t run_show(struct kobject *kobj, struct kobj_attribute *attr,
 			char *buf)
 {
-	return sprintf(buf, "%u\n", uksm_run);
+	return sprintf(buf, "%u\n", READ_ONCE(uksm_run));
 }
 
 static ssize_t run_store(struct kobject *kobj, struct kobj_attribute *attr,
@@ -5217,8 +5230,8 @@ static ssize_t run_store(struct kobject *kobj, struct kobj_attribute *attr,
 		return -EINVAL;
 
 	mutex_lock(&uksm_thread_mutex);
-	if (uksm_run != flags)
-		uksm_run = flags;
+	if (READ_ONCE(uksm_run) != flags)
+		WRITE_ONCE(uksm_run, flags);
 	mutex_unlock(&uksm_thread_mutex);
 
 	if (flags & UKSM_RUN_MERGE)
@@ -5231,7 +5244,7 @@ UKSM_ATTR(run);
 static ssize_t abundant_threshold_show(struct kobject *kobj,
 				     struct kobj_attribute *attr, char *buf)
 {
-	return sprintf(buf, "%u\n", uksm_abundant_threshold);
+	return sprintf(buf, "%u\n", READ_ONCE(uksm_abundant_threshold));
 }
 
 static ssize_t abundant_threshold_store(struct kobject *kobj,
@@ -5245,7 +5258,9 @@ static ssize_t abundant_threshold_store(struct kobject *kobj,
 	if (err || flags > 99)
 		return -EINVAL;
 
-	uksm_abundant_threshold = flags;
+	mutex_lock(&uksm_thread_mutex);
+	WRITE_ONCE(uksm_abundant_threshold, flags);
+	mutex_unlock(&uksm_thread_mutex);
 
 	return count;
 }
@@ -5254,7 +5269,7 @@ UKSM_ATTR(abundant_threshold);
 static ssize_t thrash_threshold_show(struct kobject *kobj,
 				     struct kobj_attribute *attr, char *buf)
 {
-	return sprintf(buf, "%u\n", uksm_thrash_threshold);
+	return sprintf(buf, "%u\n", READ_ONCE(uksm_thrash_threshold));
 }
 
 static ssize_t thrash_threshold_store(struct kobject *kobj,
@@ -5268,7 +5283,9 @@ static ssize_t thrash_threshold_store(struct kobject *kobj,
 	if (err || flags > 99)
 		return -EINVAL;
 
-	uksm_thrash_threshold = flags;
+	mutex_lock(&uksm_thread_mutex);
+	WRITE_ONCE(uksm_thrash_threshold, flags);
+	mutex_unlock(&uksm_thread_mutex);
 
 	return count;
 }
@@ -5277,18 +5294,19 @@ UKSM_ATTR(thrash_threshold);
 static ssize_t cpu_ratios_show(struct kobject *kobj,
 			       struct kobj_attribute *attr, char *buf)
 {
-	int i, size;
+	int cpu_ratio, i, size;
 	struct scan_rung *rung;
 	char *p = buf;
 
 	for (i = 0; i < SCAN_LADDER_SIZE; i++) {
 		rung = &uksm_scan_ladder[i];
+		cpu_ratio = READ_ONCE(rung->cpu_ratio);
 
-		if (rung->cpu_ratio > 0)
-			size = sprintf(p, "%d ", rung->cpu_ratio);
+		if (cpu_ratio > 0)
+			size = sprintf(p, "%d ", cpu_ratio);
 		else
 			size = sprintf(p, "MAX/%d ",
-					TIME_RATIO_SCALE / -rung->cpu_ratio);
+					TIME_RATIO_SCALE / -cpu_ratio);
 
 		p += size;
 	}
@@ -5348,11 +5366,13 @@ static ssize_t cpu_ratios_store(struct kobject *kobj,
 		p = end + 1;
 	}
 
+	mutex_lock(&uksm_thread_mutex);
 	for (i = 0; i < SCAN_LADDER_SIZE; i++) {
 		rung = &uksm_scan_ladder[i];
 
-		rung->cpu_ratio = cpuratios[i];
+		WRITE_ONCE(rung->cpu_ratio, cpuratios[i]);
 	}
+	mutex_unlock(&uksm_thread_mutex);
 
 out:
 	kfree(buf_copy);
@@ -5363,13 +5383,15 @@ UKSM_ATTR(cpu_ratios);
 static ssize_t eval_intervals_show(struct kobject *kobj,
 			       struct kobj_attribute *attr, char *buf)
 {
+	unsigned int cover_msecs;
 	int i, size;
 	struct scan_rung *rung;
 	char *p = buf;
 
 	for (i = 0; i < SCAN_LADDER_SIZE; i++) {
 		rung = &uksm_scan_ladder[i];
-		size = sprintf(p, "%u ", rung->cover_msecs);
+		cover_msecs = READ_ONCE(rung->cover_msecs);
+		size = sprintf(p, "%u ", cover_msecs);
 		p += size;
 	}
 
@@ -5415,11 +5437,13 @@ static ssize_t eval_intervals_store(struct kobject *kobj,
 		p = end + 1;
 	}
 
+	mutex_lock(&uksm_thread_mutex);
 	for (i = 0; i < SCAN_LADDER_SIZE; i++) {
 		rung = &uksm_scan_ladder[i];
 
-		rung->cover_msecs = values[i];
+		WRITE_ONCE(rung->cover_msecs, values[i]);
 	}
+	mutex_unlock(&uksm_thread_mutex);
 
 out:
 	kfree(buf_copy);
@@ -5806,9 +5830,41 @@ bool reuse_ksm_page(struct page *page,
 }
 #endif
 
+static void __init uksm_build_cpu_mask(struct cpumask *mask)
+{
+	unsigned long capacity, max_capacity = 0;
+	bool capacity_valid = true;
+	int cpu;
+
+	cpumask_clear(mask);
+	for_each_possible_cpu(cpu) {
+		capacity = arch_scale_cpu_capacity(cpu);
+		if (!capacity)
+			capacity_valid = false;
+		if (capacity > max_capacity)
+			max_capacity = capacity;
+	}
+
+	if (capacity_valid && max_capacity) {
+		for_each_possible_cpu(cpu) {
+			if (arch_scale_cpu_capacity(cpu) < max_capacity)
+				cpumask_set_cpu(cpu, mask);
+		}
+	}
+
+	if (!cpumask_empty(mask))
+		return;
+
+	for_each_possible_cpu(cpu) {
+		if (cpu < 6)
+			cpumask_set_cpu(cpu, mask);
+	}
+}
+
 static int __init uksm_init(void)
 {
 	struct task_struct *uksm_thread;
+	int affinity_err;
 	int err;
 
 	uksm_sleep_jiffies = msecs_to_jiffies(CONFIG_UKSM_SLEEP_MS);
@@ -5830,26 +5886,34 @@ static int __init uksm_init(void)
 	if (err)
 		goto out_free0;
 
-	uksm_thread = kthread_run(uksm_scan_thread, NULL, "uksmd");
+	uksm_thread = kthread_create(uksm_scan_thread, NULL, "uksmd");
 	if (IS_ERR(uksm_thread)) {
 		pr_err("uksm: creating kthread failed\n");
 		err = PTR_ERR(uksm_thread);
 		goto out_free;
 	}
 
-	/* Set uksmd thread CPU affinity to CPUs 0-5 and priority to 19 */
+	/*
+	 * Create uksmd with preferred non-maximum-capacity CPU affinity.
+	 * The worker sets its own nice value before scanning.
+	 */
 	{
 		cpumask_var_t cpus_mask;
+
 		if (alloc_cpumask_var(&cpus_mask, GFP_KERNEL)) {
-			cpumask_clear(cpus_mask);
-			cpumask_set_cpu(0, cpus_mask);
-			cpumask_set_cpu(1, cpus_mask);
-			cpumask_set_cpu(2, cpus_mask);
-			cpumask_set_cpu(3, cpus_mask);
-			cpumask_set_cpu(4, cpus_mask);
-			cpumask_set_cpu(5, cpus_mask);
-			set_cpus_allowed_ptr(uksm_thread, cpus_mask);
+			uksm_build_cpu_mask(cpus_mask);
+			if (!cpumask_empty(cpus_mask)) {
+				affinity_err = set_cpus_allowed_ptr(uksm_thread,
+								   cpus_mask);
+				if (affinity_err)
+					pr_warn("uksm: CPU affinity setup failed (%d), using default\n",
+						affinity_err);
+			} else {
+				pr_warn("uksm: no suitable CPU affinity mask, using default\n");
+			}
 			free_cpumask_var(cpus_mask);
+		} else {
+			pr_warn("uksm: CPU affinity mask allocation failed, using default\n");
 		}
 	}
 
@@ -5857,11 +5921,10 @@ static int __init uksm_init(void)
 	err = sysfs_create_group(mm_kobj, &uksm_attr_group);
 	if (err) {
 		pr_err("uksm: register sysfs failed\n");
-		kthread_stop(uksm_thread);
-		goto out_free;
+		goto out_stop_thread;
 	}
 #else
-	uksm_run = UKSM_RUN_MERGE;	/* no way for user to start it */
+	WRITE_ONCE(uksm_run, UKSM_RUN_MERGE); /* no way for user to start it */
 
 #endif /* CONFIG_SYSFS */
 
@@ -5870,10 +5933,23 @@ static int __init uksm_init(void)
 	 * Choose a high priority since the callback takes uksm_thread_mutex:
 	 * later callbacks could only be taking locks which nest within that.
 	 */
-	hotplug_memory_notifier(uksm_memory_callback, 100);
+	err = hotplug_memory_notifier(uksm_memory_callback, 100);
+	if (err) {
+		pr_err("uksm: register memory notifier failed\n");
+#ifdef CONFIG_SYSFS
+		sysfs_remove_group(mm_kobj, &uksm_attr_group);
 #endif
+		goto out_stop_thread;
+	}
+#endif
+
+	wake_up_process(uksm_thread);
 	return 0;
 
+#if defined(CONFIG_SYSFS) || defined(CONFIG_MEMORY_HOTREMOVE)
+out_stop_thread:
+	kthread_stop(uksm_thread);
+#endif
 out_free:
 	kfree(zero_hash_table);
 out_free0:
@@ -5918,4 +5994,3 @@ subsys_initcall(ksm_init);
 #else
 late_initcall(uksm_init);
 #endif
-
