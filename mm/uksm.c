@@ -518,6 +518,24 @@ static u64 uksm_pages_total;
 /* The number of pages has been scanned since the start up */
 static u64 uksm_pages_scanned;
 
+/*
+ * Low-benefit scan advisor state.  Merge successes count actual page
+ * replacements, including replacements with the zero page.
+ */
+#define UKSM_ADVISOR_MIN_SCAN_PAGES	4096ULL
+#define UKSM_ADVISOR_MERGE_RATE_PAGES	1000ULL
+#define UKSM_ADVISOR_UNSHARED_RATIO	8
+#define UKSM_ADVISOR_LOW_ROUNDS		3
+#define UKSM_ADVISOR_MAX_BACKOFF_LEVEL	3
+
+static u64 uksm_advisor_merge_successes;
+static u64 uksm_advisor_last_pages_scanned;
+static u64 uksm_advisor_last_merge_successes;
+static unsigned int uksm_advisor_low_benefit_streak;
+static unsigned int uksm_advisor_backoff_level;
+static unsigned int uksm_advisor_skip_scan_opportunities;
+static bool uksm_advisor_baseline_valid;
+
 static u64 scanned_virtual_pages;
 
 /* The number of pages has been scanned since last encode_benefit call */
@@ -684,6 +702,110 @@ struct list_head vma_slot_new = LIST_HEAD_INIT(vma_slot_new);
 struct list_head vma_slot_noadd = LIST_HEAD_INIT(vma_slot_noadd);
 struct list_head vma_slot_del = LIST_HEAD_INIT(vma_slot_del);
 static DEFINE_SPINLOCK(vma_slot_list_lock);
+
+static void uksm_advisor_reset(void)
+{
+	uksm_advisor_last_pages_scanned = 0;
+	uksm_advisor_last_merge_successes = 0;
+	uksm_advisor_low_benefit_streak = 0;
+	uksm_advisor_backoff_level = 0;
+	uksm_advisor_skip_scan_opportunities = 0;
+	uksm_advisor_baseline_valid = false;
+}
+
+static bool uksm_advisor_high_unshared_ratio(unsigned long pages_unshared,
+					     unsigned long pages_sharing)
+{
+	unsigned long ratio;
+
+	if (!pages_sharing)
+		return pages_unshared >= UKSM_ADVISOR_MIN_SCAN_PAGES;
+
+	ratio = pages_unshared / UKSM_ADVISOR_UNSHARED_RATIO;
+	return ratio > pages_sharing ||
+	       (ratio == pages_sharing &&
+		pages_unshared % UKSM_ADVISOR_UNSHARED_RATIO);
+}
+
+static void uksm_advisor_scan_round_finished(void)
+{
+	u64 pages_scanned = uksm_pages_scanned;
+	u64 merge_successes = uksm_advisor_merge_successes;
+	u64 delta_scanned, delta_merge_successes, min_merge_successes;
+	bool low_benefit;
+
+	if (!uksm_advisor_baseline_valid) {
+		uksm_advisor_baseline_valid = true;
+		goto update_baseline;
+	}
+
+	if (pages_scanned < uksm_advisor_last_pages_scanned ||
+	    merge_successes < uksm_advisor_last_merge_successes)
+		goto reset_streak;
+
+	delta_scanned = pages_scanned - uksm_advisor_last_pages_scanned;
+	delta_merge_successes =
+		merge_successes - uksm_advisor_last_merge_successes;
+	if (delta_scanned < UKSM_ADVISOR_MIN_SCAN_PAGES)
+		goto reset_streak;
+
+	min_merge_successes =
+		delta_scanned / UKSM_ADVISOR_MERGE_RATE_PAGES;
+	if (delta_scanned % UKSM_ADVISOR_MERGE_RATE_PAGES)
+		min_merge_successes++;
+
+	low_benefit =
+		delta_merge_successes < min_merge_successes &&
+		uksm_advisor_high_unshared_ratio(uksm_pages_unshared,
+						uksm_pages_sharing);
+	if (!low_benefit) {
+		uksm_advisor_low_benefit_streak = 0;
+		if (uksm_advisor_backoff_level) {
+			uksm_advisor_reset();
+			return;
+		}
+		goto update_baseline;
+	}
+
+	uksm_advisor_low_benefit_streak++;
+	if (uksm_advisor_low_benefit_streak < UKSM_ADVISOR_LOW_ROUNDS)
+		goto update_baseline;
+
+	uksm_advisor_low_benefit_streak = 0;
+	if (uksm_advisor_backoff_level < UKSM_ADVISOR_MAX_BACKOFF_LEVEL)
+		uksm_advisor_backoff_level++;
+	uksm_advisor_skip_scan_opportunities =
+		1U << (uksm_advisor_backoff_level - 1);
+	goto update_baseline;
+
+reset_streak:
+	uksm_advisor_low_benefit_streak = 0;
+update_baseline:
+	uksm_advisor_last_pages_scanned = pages_scanned;
+	uksm_advisor_last_merge_successes = merge_successes;
+}
+
+static bool uksm_advisor_should_skip_scan(void)
+{
+	bool vma_work_pending;
+
+	if (!uksm_advisor_skip_scan_opportunities)
+		return false;
+
+	spin_lock(&vma_slot_list_lock);
+	vma_work_pending = !list_empty(&vma_slot_new) ||
+			   !list_empty(&vma_slot_del);
+	spin_unlock(&vma_slot_list_lock);
+
+	if (vma_work_pending) {
+		uksm_advisor_skip_scan_opportunities = 0;
+		uksm_advisor_low_benefit_streak = 0;
+		return false;
+	}
+
+	uksm_advisor_skip_scan_opportunities--;
+	return true;
+}
 
 /* The unstable tree heads */
 static struct rb_root root_unstable_tree = RB_ROOT;
@@ -1779,6 +1901,7 @@ static int replace_page(struct vm_area_struct *vma, struct page *page,
 	folio_put(folio);
 
 	pte_unmap_unlock(ptep, ptl);
+	uksm_advisor_merge_successes++;
 	err = 0;
 out_mn:
 	mmu_notifier_invalidate_range_end(&range);
@@ -4843,6 +4966,7 @@ rm_slot:
 	if (round_finished) {
 		round_update_ladder();
 		uksm_eval_round++;
+		uksm_advisor_scan_round_finished();
 
 		if (hash_round_finished() && rshash_adjust()) {
 			/* Reset the unstable root iff hash strength changed */
@@ -4905,7 +5029,7 @@ static int uksm_scan_thread(void *nothing)
 
 	while (!kthread_should_stop()) {
 		mutex_lock(&uksm_thread_mutex);
-		if (ksmd_should_run())
+		if (ksmd_should_run() && !uksm_advisor_should_skip_scan())
 			uksm_do_scan();
 		mutex_unlock(&uksm_thread_mutex);
 
@@ -5108,7 +5232,10 @@ static ssize_t max_cpu_percentage_store(struct kobject *kobj,
 		max_cpu_percentage = 1;
 
 	mutex_lock(&uksm_thread_mutex);
-	WRITE_ONCE(uksm_max_cpu_percentage, max_cpu_percentage);
+	if (READ_ONCE(uksm_max_cpu_percentage) != max_cpu_percentage) {
+		WRITE_ONCE(uksm_max_cpu_percentage, max_cpu_percentage);
+		uksm_advisor_reset();
+	}
 	mutex_unlock(&uksm_thread_mutex);
 
 	return count;
@@ -5137,8 +5264,12 @@ static ssize_t sleep_millisecs_store(struct kobject *kobj,
 	sleep_jiffies = msecs_to_jiffies(msecs);
 
 	mutex_lock(&uksm_thread_mutex);
-	WRITE_ONCE(uksm_sleep_jiffies, sleep_jiffies);
-	WRITE_ONCE(uksm_sleep_saved, sleep_jiffies);
+	if (READ_ONCE(uksm_sleep_jiffies) != sleep_jiffies ||
+	    READ_ONCE(uksm_sleep_saved) != sleep_jiffies) {
+		WRITE_ONCE(uksm_sleep_jiffies, sleep_jiffies);
+		WRITE_ONCE(uksm_sleep_saved, sleep_jiffies);
+		uksm_advisor_reset();
+	}
 	mutex_unlock(&uksm_thread_mutex);
 
 	return count;
@@ -5191,7 +5322,11 @@ static ssize_t cpu_governor_store(struct kobject *kobj,
 				   struct kobj_attribute *attr,
 				   const char *buf, size_t count)
 {
+	struct uksm_cpu_preset_s *preset;
+	struct scan_rung *rung;
+	bool changed;
 	int n = sizeof(uksm_cpu_governor_str) / sizeof(char *);
+	int i;
 
 	for (n--; n >= 0 ; n--) {
 		if (!strncmp(buf, uksm_cpu_governor_str[n],
@@ -5203,8 +5338,19 @@ static ssize_t cpu_governor_store(struct kobject *kobj,
 		return -EINVAL;
 
 	mutex_lock(&uksm_thread_mutex);
+	preset = &uksm_cpu_preset[n];
+	changed = READ_ONCE(uksm_cpu_governor) != n ||
+		  READ_ONCE(uksm_max_cpu_percentage) != preset->max_cpu;
+	for (i = 0; i < SCAN_LADDER_SIZE && !changed; i++) {
+		rung = &uksm_scan_ladder[i];
+		changed = READ_ONCE(rung->cpu_ratio) != preset->cpu_ratio[i] ||
+			  READ_ONCE(rung->cover_msecs) !=
+				  preset->cover_msecs[i];
+	}
 	WRITE_ONCE(uksm_cpu_governor, n);
 	init_performance_values();
+	if (changed)
+		uksm_advisor_reset();
 	mutex_unlock(&uksm_thread_mutex);
 
 	return count;
@@ -5221,6 +5367,7 @@ static ssize_t run_store(struct kobject *kobj, struct kobj_attribute *attr,
 			 const char *buf, size_t count)
 {
 	int err;
+	unsigned int old_flags;
 	unsigned long flags;
 
 	err = kstrtoul(buf, 10, &flags);
@@ -5230,8 +5377,13 @@ static ssize_t run_store(struct kobject *kobj, struct kobj_attribute *attr,
 		return -EINVAL;
 
 	mutex_lock(&uksm_thread_mutex);
-	if (READ_ONCE(uksm_run) != flags)
+	old_flags = READ_ONCE(uksm_run);
+	if (old_flags != flags) {
 		WRITE_ONCE(uksm_run, flags);
+		if (!(old_flags & UKSM_RUN_MERGE) &&
+		    (flags & UKSM_RUN_MERGE))
+			uksm_advisor_reset();
+	}
 	mutex_unlock(&uksm_thread_mutex);
 
 	if (flags & UKSM_RUN_MERGE)
@@ -5325,6 +5477,7 @@ static ssize_t cpu_ratios_store(struct kobject *kobj,
 	unsigned long value;
 	struct scan_rung *rung;
 	char *buf_copy, *p, *end = NULL;
+	bool changed = false;
 	ssize_t ret = count;
 
 	buf_copy = kmemdup_nul(buf, count, GFP_KERNEL);
@@ -5370,8 +5523,12 @@ static ssize_t cpu_ratios_store(struct kobject *kobj,
 	for (i = 0; i < SCAN_LADDER_SIZE; i++) {
 		rung = &uksm_scan_ladder[i];
 
+		if (READ_ONCE(rung->cpu_ratio) != cpuratios[i])
+			changed = true;
 		WRITE_ONCE(rung->cpu_ratio, cpuratios[i]);
 	}
+	if (changed)
+		uksm_advisor_reset();
 	mutex_unlock(&uksm_thread_mutex);
 
 out:
@@ -5409,6 +5566,7 @@ static ssize_t eval_intervals_store(struct kobject *kobj,
 	unsigned long values[SCAN_LADDER_SIZE];
 	struct scan_rung *rung;
 	char *buf_copy, *p, *end = NULL;
+	bool changed = false;
 	ssize_t ret = count;
 
 	buf_copy = kmemdup_nul(buf, count, GFP_KERNEL);
@@ -5441,8 +5599,13 @@ static ssize_t eval_intervals_store(struct kobject *kobj,
 	for (i = 0; i < SCAN_LADDER_SIZE; i++) {
 		rung = &uksm_scan_ladder[i];
 
+		if (READ_ONCE(rung->cover_msecs) !=
+		    (unsigned int)values[i])
+			changed = true;
 		WRITE_ONCE(rung->cover_msecs, values[i]);
 	}
+	if (changed)
+		uksm_advisor_reset();
 	mutex_unlock(&uksm_thread_mutex);
 
 out:
