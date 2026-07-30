@@ -1,10 +1,12 @@
 // SPDX-License-Identifier: GPL-2.0
 
+#include <linux/init.h>
 #include <linux/jiffies.h>
 #include <linux/kallsyms.h>
 #include <linux/kernel.h>
 #include <linux/mutex.h>
 #include <linux/printk.h>
+#include <linux/sysctl.h>
 #include <linux/types.h>
 
 #include <linux/sysms_finder.h>
@@ -31,6 +33,48 @@ static struct symbol_entry symbols_status[NR_SYMBOLS] = {
 };
 
 static DEFINE_MUTEX(symbol_lookup_lock);
+
+static int sysms_game_pid_missing_policy;
+
+#ifdef CONFIG_SYSCTL
+static int sysms_game_pid_missing_policy_handler(struct ctl_table *table,
+						 int write, void *buffer,
+						 size_t *lenp, loff_t *ppos)
+{
+	struct ctl_table tmp = *table;
+	int policy = READ_ONCE(sysms_game_pid_missing_policy);
+	int ret;
+
+	tmp.data = &policy;
+	ret = proc_dointvec_minmax(&tmp, write, buffer, lenp, ppos);
+	if (!ret && write)
+		WRITE_ONCE(sysms_game_pid_missing_policy, policy);
+
+	return ret;
+}
+
+static struct ctl_table sysms_finder_sysctls[] = {
+	{
+		.procname	= "sysms_game_pid_missing_policy",
+		.data		= NULL,
+		.maxlen		= sizeof(int),
+		.mode		= 0644,
+		.proc_handler	= sysms_game_pid_missing_policy_handler,
+		.extra1		= SYSCTL_ZERO,
+		.extra2		= SYSCTL_ONE,
+	},
+	{ }
+};
+
+static int __init sysms_finder_sysctl_init(void)
+{
+	if (!register_sysctl("kernel", sysms_finder_sysctls))
+		pr_warn_once("sysms_finder: failed to register game PID policy sysctl\n");
+
+	return 0;
+}
+late_initcall(sysms_finder_sysctl_init);
+#endif
 
 unsigned long lookup_symbol(int symbol_index)
 {
@@ -81,7 +125,7 @@ bool check_game_pid(void)
 
 	addr = lookup_symbol(SYMBOL_GAME_PID);
 	if (!addr)
-		return true;
+		return !READ_ONCE(sysms_game_pid_missing_policy);
 
 	game_pid = (pid_t *)addr;
 	return READ_ONCE(*game_pid) == -1;
