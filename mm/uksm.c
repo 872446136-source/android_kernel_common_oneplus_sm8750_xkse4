@@ -70,6 +70,7 @@
 #include <linux/scatterlist.h>
 #include <crypto/hash.h>
 #include <linux/random.h>
+#include <linux/jiffies.h>
 #include <linux/math64.h>
 #include <linux/gcd.h>
 #include <linux/freezer.h>
@@ -500,6 +501,31 @@ static struct scan_rung uksm_scan_ladder[SCAN_LADDER_SIZE];
 
 /* The evaluation rounds uksmd has finished */
 static unsigned long long uksm_eval_round = 1;
+
+#define UKSM_LRU_DRAIN_ROUND_INTERVAL	4ULL
+#define UKSM_LRU_DRAIN_MAX_INTERVAL	(10 * 60 * HZ)
+
+static u64 uksm_last_lru_drain_round;
+static unsigned long uksm_last_lru_drain_jiffies;
+static bool uksm_lru_drain_initialized;
+
+static void uksm_maybe_lru_add_drain_all(void)
+{
+	u64 current_round = uksm_eval_round;
+	unsigned long now = jiffies;
+
+	if (uksm_lru_drain_initialized &&
+	    current_round - uksm_last_lru_drain_round <
+		    UKSM_LRU_DRAIN_ROUND_INTERVAL &&
+	    !time_after_eq(now, uksm_last_lru_drain_jiffies +
+			       UKSM_LRU_DRAIN_MAX_INTERVAL))
+		return;
+
+	lru_add_drain_all();
+	uksm_last_lru_drain_round = current_round;
+	uksm_last_lru_drain_jiffies = now;
+	uksm_lru_drain_initialized = true;
+}
 
 /*
  * we add 1 to this var when we consider we should rebuild the whole
@@ -4985,7 +5011,7 @@ rm_slot:
 		 * them here (here rather than on entry to uksm_do_scan(),
 		 * so we don't IPI too often when pages_to_scan is set low).
 		 */
-		lru_add_drain_all();
+		uksm_maybe_lru_add_drain_all();
 	}
 
 
