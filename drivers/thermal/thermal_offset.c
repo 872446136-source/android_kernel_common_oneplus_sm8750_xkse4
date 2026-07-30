@@ -33,7 +33,8 @@ thermal_runtime_offset_domain_for_type(const char *type)
 	if (!type)
 		return THERMAL_RUNTIME_OFFSET_NONE;
 
-	if (!strncmp(type, "cpu-", sizeof("cpu-") - 1))
+	if (!strncmp(type, "cpu-", sizeof("cpu-") - 1) ||
+	    !strncmp(type, "cpuss-", sizeof("cpuss-") - 1))
 		return THERMAL_RUNTIME_OFFSET_CPU;
 
 	if (!strncmp(type, "gpuss-", sizeof("gpuss-") - 1))
