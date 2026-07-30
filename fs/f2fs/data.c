@@ -2166,10 +2166,13 @@ static int f2fs_read_single_page(struct inode *inode, struct folio *folio,
 	/*
 	 * Map blocks using the previous result first.
 	 */
-	if ((map->m_flags & F2FS_MAP_MAPPED) &&
-			block_in_file > map->m_lblk &&
+	if (map->m_flags & F2FS_MAP_MAPPED) {
+		if (block_in_file > map->m_lblk &&
 			block_in_file < (map->m_lblk + map->m_len))
+			goto got_it;
+	} else if (block_in_file < *map->m_next_pgofs) {
 		goto got_it;
+	}
 
 	/*
 	 * Then do more f2fs_map_blocks() calls until we are
@@ -2456,6 +2459,7 @@ static int f2fs_mpage_readpages(struct inode *inode,
 	pgoff_t nc_cluster_idx = NULL_CLUSTER;
 	pgoff_t index;
 #endif
+	pgoff_t next_pgofs = 0;
 	unsigned nr_pages = rac ? readahead_count(rac) : 1;
 	unsigned max_nr_pages = nr_pages;
 	int ret = 0;
@@ -2464,7 +2468,7 @@ static int f2fs_mpage_readpages(struct inode *inode,
 	map.m_lblk = 0;
 	map.m_len = 0;
 	map.m_flags = 0;
-	map.m_next_pgofs = NULL;
+	map.m_next_pgofs = &next_pgofs;
 	map.m_next_extent = NULL;
 	map.m_seg_type = NO_CHECK_TYPE;
 	map.m_may_create = false;
