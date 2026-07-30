@@ -4885,7 +4885,7 @@ rm_slot:
 
 		/* We have a 180 second up bound for responsiveness. */
 		if (jiffies_to_msecs(uksm_sleep_real) > MSEC_PER_SEC * 180)
-			uksm_sleep_real = msecs_to_jiffies(1000);
+			uksm_sleep_real = msecs_to_jiffies(MSEC_PER_SEC * 180);
 	}
 
 	return;
@@ -5309,12 +5309,11 @@ static ssize_t cpu_ratios_store(struct kobject *kobj,
 	char *buf_copy, *p, *end = NULL;
 	ssize_t ret = count;
 
-	buf_copy = kzalloc(count, GFP_KERNEL);
+	buf_copy = kmemdup_nul(buf, count, GFP_KERNEL);
 	if (!buf_copy)
 		return -ENOMEM;
 
 	p = buf_copy;
-	memcpy(p, buf, count);
 
 	for (i = 0; i < SCAN_LADDER_SIZE; i++) {
 		if (i != SCAN_LADDER_SIZE - 1) {
@@ -5387,14 +5386,14 @@ static ssize_t eval_intervals_store(struct kobject *kobj,
 	int i, err;
 	unsigned long values[SCAN_LADDER_SIZE];
 	struct scan_rung *rung;
-	char *p, *end = NULL;
+	char *buf_copy, *p, *end = NULL;
 	ssize_t ret = count;
 
-	p = kzalloc(count + 2, GFP_KERNEL);
-	if (!p)
+	buf_copy = kmemdup_nul(buf, count, GFP_KERNEL);
+	if (!buf_copy)
 		return -ENOMEM;
 
-	memcpy(p, buf, count);
+	p = buf_copy;
 
 	for (i = 0; i < SCAN_LADDER_SIZE; i++) {
 		if (i != SCAN_LADDER_SIZE - 1) {
@@ -5423,7 +5422,7 @@ static ssize_t eval_intervals_store(struct kobject *kobj,
 	}
 
 out:
-	kfree(p);
+	kfree(buf_copy);
 	return ret;
 }
 UKSM_ATTR(eval_intervals);

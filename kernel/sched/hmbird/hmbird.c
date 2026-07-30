@@ -2990,7 +2990,7 @@ static s32 hmbird_select_cpu_dfl(struct task_struct *p, s32 prev_cpu, u64 wake_f
 	/* For non-period global dsq, not contain pcp task. */
 	if (task_only_blongs_to_cluster(p, LITTLE)) {
 		cpumask_copy(&mask, iso_masks.little);
-		if (unlikely(l_need_rescue)) {
+		if (unlikely(is_little_need_rescue())) {
 			cpumask_or(&mask, iso_masks.partial, &mask);
 			cpumask_or(&mask, iso_masks.ex_free, &mask);
 		}
@@ -3005,7 +3005,7 @@ static s32 hmbird_select_cpu_dfl(struct task_struct *p, s32 prev_cpu, u64 wake_f
 
 	if (task_only_blongs_to_cluster(p, BIG)) {
 		cpumask_copy(&mask, iso_masks.big);
-		if (unlikely(b_need_rescue)) {
+		if (unlikely(is_big_need_rescue())) {
 			cpumask_or(&mask, iso_masks.partial, &mask);
 			cpumask_or(&mask, iso_masks.ex_free, &mask);
 		}
