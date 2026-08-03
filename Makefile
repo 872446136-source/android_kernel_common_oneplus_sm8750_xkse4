@@ -848,7 +848,7 @@ KBUILD_RUSTFLAGS += -Copt-level=s
 endif
 
 ifeq ($(SRCARCH),arm64)
-KBUILD_CFLAGS += -march=armv9.1-a+nosve+crypto+sha3+sm4+rng
+KBUILD_CFLAGS += -march=armv8.7-a+crypto+sha3+sm4+rng+nosve
 endif
 
 # Always set `debug-assertions` and `overflow-checks` because their default
