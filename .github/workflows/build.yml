@@ -1,0 +1,59 @@
+name: OnePlus13 OPPO6.6 Kernel
+
+on:
+  workflow_dispatch:
+
+jobs:
+
+  build:
+
+    runs-on: ubuntu-22.04
+
+    steps:
+
+    - name: Checkout source
+      uses: actions/checkout@v4
+
+
+    - name: Install dependencies
+      run: |
+        sudo apt update
+        sudo apt install -y \
+          bc \
+          bison \
+          flex \
+          libssl-dev \
+          python3 \
+          zip \
+          ccache
+
+
+    - name: Build Kernel
+      run: |
+        chmod +x build.sh
+        ./build.sh
+
+
+    - name: Package Kernel
+      run: |
+
+        mkdir -p release
+
+        cp out/**/Image.lz4 release/
+
+
+        cd release
+
+        zip -r \
+        OnePlus13_OPPO6.6_ReSukiSU_SUSFS.zip \
+        .
+
+
+    - name: Upload Artifact
+      uses: actions/upload-artifact@v4
+
+      with:
+
+        name: OnePlus13_OPPO6.6_ReSukiSU_SUSFS
+
+        path: release/*
