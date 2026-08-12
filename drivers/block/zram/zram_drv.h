@@ -19,11 +19,14 @@
 #include <linux/rwsem.h>
 #include <linux/lockdep.h>
 #include <linux/wait.h>
+#include <linux/xarray.h>
 #include <linux/zsmalloc.h>
 
 #include "zcomp.h"
 #include "zram_pp.h"
 #include "zram_rep.h"
+#include "zram_engine.h"
+#include "zram_pwb.h"
 
 #define SECTORS_PER_PAGE_SHIFT	(PAGE_SHIFT - SECTOR_SHIFT)
 #define SECTORS_PER_PAGE	(1 << SECTORS_PER_PAGE_SHIFT)
@@ -102,6 +105,15 @@ struct zram_stats {
 #endif
 };
 
+struct zram_publish_obj {
+	unsigned long handle;
+	unsigned long element;
+	u32 size;
+	u64 owner;
+	u8 type;
+	bool incompressible;
+};
+
 #ifdef CONFIG_ZRAM_MULTI_COMP
 #define ZRAM_PRIMARY_COMP	0U
 #define ZRAM_SECONDARY_COMP	1U
@@ -112,19 +124,27 @@ struct zram_stats {
 #define ZRAM_MAX_COMPS	1U
 #endif
 
-#define ZRAM_MAX_CODECS	ZRAM_MAX_COMPS
+/* u8 on-representation IDs; policy remains the existing four ranks. */
+#define ZRAM_MAX_CODECS	U8_MAX
 
 struct zram {
 	struct zram_table_entry *table;
+	struct zram_slot_state *slot_state;
 	struct zs_pool *mem_pool;
 	/* Stable decoder instances, indexed by codec identity (zero is none). */
 	struct zcomp *codecs[ZRAM_MAX_CODECS + 1];
+	atomic_t codec_rep_refs[ZRAM_MAX_CODECS + 1];
+	u16 codec_generation[ZRAM_MAX_CODECS + 1];
+	u8 next_codec_id;
 	/* Mutable policy priority to stable codec identity mapping. */
 	u8 policy_codecs[ZRAM_MAX_COMPS];
 	struct zcomp_params params[ZRAM_MAX_COMPS];
-	struct xarray slot_meta;
-	atomic64_t mutation_seq;
+	/* Sparse metadata exists only for REF/ALIAS/DELTA/PACKED_BACKING. */
+	struct xarray slot_ext;
+	atomic_t rep_epoch;
 	struct zram_pp_scheduler pp_scheduler;
+	struct zram_engine engine;
+	struct zram_pwb pwb;
 	struct gendisk *disk;
 	/* Prevent concurrent execution of device init */
 	struct rw_semaphore init_lock;
@@ -164,4 +184,31 @@ struct zram {
 	struct dentry *debugfs_dir;
 #endif
 };
+
+int zram_codec_rep_get(struct zram *zram, u8 codec_id);
+void zram_codec_rep_put(struct zram *zram, u8 codec_id);
+void zram_slot_lock(struct zram *zram, u32 index);
+void zram_slot_lock_nested(struct zram *zram, u32 index, int subclass);
+void zram_slot_unlock(struct zram *zram, u32 index);
+size_t zram_get_obj_size(struct zram *zram, u32 index);
+unsigned long zram_get_handle(struct zram *zram, u32 index);
+void zram_set_handle(struct zram *zram, u32 index, unsigned long handle);
+void zram_set_obj_size(struct zram *zram, u32 index, size_t size);
+struct zcomp *zram_codec_by_id(struct zram *zram, u8 codec_id);
+struct zcomp *zram_comp_at_priority(struct zram *zram, u32 prio);
+u8 zram_policy_codec_id(struct zram *zram, u32 prio);
+int zram_read_from_zspool(struct zram *zram, struct page *page, u32 index);
+void zram_release_slot_data_locked(
+	struct zram *zram, size_t index,
+	const struct zram_slot_snapshot *snapshot);
+void zram_publish_object_locked(struct zram *zram, u32 index,
+		const struct zram_slot_snapshot *old, void *private);
+int zram_store_page_if_current(struct zram *zram, struct page *page,
+			       struct zram_slot_txn *txn);
+#ifdef CONFIG_ZRAM_WRITEBACK
+unsigned long zram_backing_alloc(struct zram *zram, u32 blocks);
+void zram_backing_free(struct zram *zram, unsigned long block, u32 blocks);
+bool zram_backing_write_reserve(struct zram *zram, u32 blocks);
+void zram_backing_write_rollback(struct zram *zram, u32 blocks);
+#endif
 #endif

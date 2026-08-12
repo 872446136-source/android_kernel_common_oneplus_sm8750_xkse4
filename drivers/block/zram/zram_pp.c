@@ -6,6 +6,11 @@
 
 #include "zram_drv.h"
 
+#define ZRAM_PP_DEFAULT_PENDING	256U
+#define ZRAM_PP_FAULT_CONCURRENCY	4U
+#define ZRAM_PP_CPU_CONCURRENCY	2U
+#define ZRAM_PP_WRITE_CONCURRENCY	2U
+
 static void zram_pp_operation_get(struct zram_pp_operation *operation)
 {
 	refcount_inc(&operation->refs);
@@ -70,16 +75,134 @@ static bool zram_pp_operation_add_job(struct zram_pp_operation *operation)
 	return accepted;
 }
 
-void zram_pp_scheduler_init(struct zram_pp_scheduler *scheduler)
+static struct zram_pp_job *
+zram_pp_job_alloc(struct zram_pp_scheduler *scheduler, gfp_t gfp)
 {
+	struct zram_pp_job *job;
+
+	if (atomic_inc_return(&scheduler->pending_jobs) >
+	    scheduler->max_pending_jobs) {
+		atomic_dec(&scheduler->pending_jobs);
+		return NULL;
+	}
+	job = mempool_alloc(scheduler->job_pool, gfp);
+	if (!job) {
+		atomic_dec(&scheduler->pending_jobs);
+		return NULL;
+	}
+	memset(job, 0, sizeof(*job));
+	INIT_LIST_HEAD(&job->entry);
+	job->scheduler = scheduler;
+	return job;
+}
+
+static void zram_pp_job_drop(struct zram_pp_job *job)
+{
+	struct zram_pp_scheduler *scheduler = job->scheduler;
+	struct zram_pp_operation *operation = job->operation;
+
+	if (operation) {
+		int active_jobs = atomic_dec_return(&operation->active_jobs);
+
+		if (WARN_ON_ONCE(active_jobs < 0))
+			active_jobs = 0;
+		if (!active_jobs)
+			zram_pp_operation_maybe_complete(operation);
+		zram_pp_operation_put(operation);
+	}
+	mempool_free(job, scheduler->job_pool);
+	WARN_ON_ONCE(atomic_dec_return(&scheduler->pending_jobs) < 0);
+	wake_up_all(&scheduler->wait);
+}
+
+static void zram_pp_async_work(struct work_struct *work)
+{
+	struct zram_pp_job *job = container_of(work, struct zram_pp_job, work);
+	struct zram_pp_scheduler *scheduler = job->scheduler;
+	u64 generation;
+	void *current;
+
+	for (;;) {
+		generation = READ_ONCE(job->generation);
+		if (test_bit(ZRAM_PP_CANCELLED, &job->state) ||
+		    READ_ONCE(scheduler->stopping))
+			break;
+		set_bit(ZRAM_PP_RUNNING, &job->state);
+		job->run(scheduler->zram, job);
+		clear_bit(ZRAM_PP_RUNNING, &job->state);
+
+		zram_slot_lock(scheduler->zram, job->index);
+		current = xa_load(&scheduler->slot_jobs, job->index);
+		if (current == job &&
+		    !test_bit(ZRAM_PP_CANCELLED, &job->state) &&
+		    !READ_ONCE(scheduler->stopping) &&
+		    generation != READ_ONCE(job->generation)) {
+			zram_slot_unlock(scheduler->zram, job->index);
+			cond_resched();
+			continue;
+		}
+		set_bit(ZRAM_PP_DONE, &job->state);
+		current = xa_cmpxchg(&scheduler->slot_jobs, job->index, job,
+				     NULL, 0);
+		zram_slot_unlock(scheduler->zram, job->index);
+		WARN_ON_ONCE(xa_is_err(current));
+		zram_pp_job_drop(job);
+		return;
+	}
+
+	zram_slot_lock(scheduler->zram, job->index);
+	set_bit(ZRAM_PP_DONE, &job->state);
+	current = xa_cmpxchg(&scheduler->slot_jobs, job->index, job, NULL, 0);
+	zram_slot_unlock(scheduler->zram, job->index);
+	WARN_ON_ONCE(xa_is_err(current));
+	zram_pp_job_drop(job);
+}
+
+int zram_pp_scheduler_init(struct zram_pp_scheduler *scheduler,
+			   struct zram *zram)
+{
+	memset(scheduler, 0, sizeof(*scheduler));
+	scheduler->zram = zram;
 	xa_init(&scheduler->slot_jobs);
 	spin_lock_init(&scheduler->lock);
 	INIT_LIST_HEAD(&scheduler->operations);
 	init_waitqueue_head(&scheduler->wait);
 	atomic64_set(&scheduler->next_id, 0);
 	atomic_set(&scheduler->active_operations, 0);
-	scheduler->active_types = 0;
-	scheduler->stopping = false;
+	atomic_set(&scheduler->pending_jobs, 0);
+	atomic_set(&scheduler->active_io, 0);
+	scheduler->max_pending_jobs = ZRAM_PP_DEFAULT_PENDING;
+
+	scheduler->job_pool = mempool_create_kmalloc_pool(
+		ZRAM_PP_DEFAULT_PENDING, sizeof(struct zram_pp_job));
+	if (!scheduler->job_pool)
+		goto fail;
+	scheduler->fault_wq = alloc_workqueue("zram_pp_fault",
+		WQ_UNBOUND | WQ_HIGHPRI | WQ_MEM_RECLAIM,
+		ZRAM_PP_FAULT_CONCURRENCY);
+	if (!scheduler->fault_wq)
+		goto fail;
+	scheduler->write_wq = alloc_workqueue("zram_pp_write",
+		WQ_UNBOUND | WQ_MEM_RECLAIM, ZRAM_PP_WRITE_CONCURRENCY);
+	if (!scheduler->write_wq)
+		goto fail;
+	scheduler->cpu_wq = alloc_workqueue("zram_pp_cpu",
+		WQ_UNBOUND | WQ_MEM_RECLAIM,
+		ZRAM_PP_CPU_CONCURRENCY);
+	if (!scheduler->cpu_wq)
+		goto fail;
+	return 0;
+
+fail:
+	if (scheduler->cpu_wq)
+		destroy_workqueue(scheduler->cpu_wq);
+	if (scheduler->write_wq)
+		destroy_workqueue(scheduler->write_wq);
+	if (scheduler->fault_wq)
+		destroy_workqueue(scheduler->fault_wq);
+	mempool_destroy(scheduler->job_pool);
+	xa_destroy(&scheduler->slot_jobs);
+	return -ENOMEM;
 }
 
 void zram_pp_scheduler_quiesce(struct zram_pp_scheduler *scheduler)
@@ -92,9 +215,14 @@ void zram_pp_scheduler_quiesce(struct zram_pp_scheduler *scheduler)
 	list_for_each_entry(operation, &scheduler->operations, entry)
 		set_bit(ZRAM_PP_CANCELLED, &operation->state);
 	spin_unlock_irqrestore(&scheduler->lock, flags);
-
+	flush_workqueue(scheduler->cpu_wq);
+	flush_workqueue(scheduler->write_wq);
+	flush_workqueue(scheduler->fault_wq);
 	wait_event(scheduler->wait,
-		   !atomic_read(&scheduler->active_operations));
+		   !atomic_read(&scheduler->active_operations) &&
+		   !atomic_read(&scheduler->pending_jobs) &&
+		   !atomic_read(&scheduler->active_io));
+	WARN_ON_ONCE(!xa_empty(&scheduler->slot_jobs));
 }
 
 void zram_pp_scheduler_resume(struct zram_pp_scheduler *scheduler)
@@ -103,6 +231,8 @@ void zram_pp_scheduler_resume(struct zram_pp_scheduler *scheduler)
 
 	spin_lock_irqsave(&scheduler->lock, flags);
 	WARN_ON_ONCE(atomic_read(&scheduler->active_operations));
+	WARN_ON_ONCE(atomic_read(&scheduler->pending_jobs));
+	WARN_ON_ONCE(atomic_read(&scheduler->active_io));
 	scheduler->stopping = false;
 	spin_unlock_irqrestore(&scheduler->lock, flags);
 }
@@ -110,7 +240,10 @@ void zram_pp_scheduler_resume(struct zram_pp_scheduler *scheduler)
 void zram_pp_scheduler_fini(struct zram_pp_scheduler *scheduler)
 {
 	zram_pp_scheduler_quiesce(scheduler);
-	WARN_ON_ONCE(!xa_empty(&scheduler->slot_jobs));
+	destroy_workqueue(scheduler->cpu_wq);
+	destroy_workqueue(scheduler->write_wq);
+	destroy_workqueue(scheduler->fault_wq);
+	mempool_destroy(scheduler->job_pool);
 	xa_destroy(&scheduler->slot_jobs);
 }
 
@@ -133,16 +266,16 @@ zram_pp_operation_begin(struct zram_pp_scheduler *scheduler,
 	operation->scheduler = scheduler;
 	operation->type = type;
 	operation->priority = priority;
-	operation->budget.max_pages = max_pages;
-	operation->budget.max_bytes = max_bytes;
+	operation->budget.logical_limit = max_pages;
+	operation->budget.resident_limit = max_bytes;
+	operation->budget.candidate_limit = scheduler->max_pending_jobs;
 	spin_lock_init(&operation->budget.lock);
 	INIT_LIST_HEAD(&operation->entry);
 	refcount_set(&operation->refs, 1);
 	atomic_set(&operation->active_jobs, 0);
 
 	spin_lock_irqsave(&scheduler->lock, flags);
-	if (scheduler->stopping ||
-	    test_bit(type, &scheduler->active_types)) {
+	if (scheduler->stopping || test_bit(type, &scheduler->active_types)) {
 		spin_unlock_irqrestore(&scheduler->lock, flags);
 		kfree(operation);
 		return ERR_PTR(-EBUSY);
@@ -150,24 +283,22 @@ zram_pp_operation_begin(struct zram_pp_scheduler *scheduler,
 	set_bit(type, &scheduler->active_types);
 	operation->id = (u64)atomic64_inc_return(&scheduler->next_id);
 	if (unlikely(!operation->id))
-		operation->id =
-			(u64)atomic64_inc_return(&scheduler->next_id);
-	WARN_ON_ONCE(!operation->id);
+		operation->id = (u64)atomic64_inc_return(&scheduler->next_id);
 	list_add_tail(&operation->entry, &scheduler->operations);
 	atomic_inc(&scheduler->active_operations);
 	spin_unlock_irqrestore(&scheduler->lock, flags);
-
 	return operation;
 }
 
 void zram_pp_operation_cancel(struct zram_pp_operation *operation)
 {
-	set_bit(ZRAM_PP_CANCELLED, &operation->state);
+	if (operation)
+		set_bit(ZRAM_PP_CANCELLED, &operation->state);
 }
 
 bool zram_pp_operation_cancelled(const struct zram_pp_operation *operation)
 {
-	return test_bit(ZRAM_PP_CANCELLED, &operation->state);
+	return !operation || test_bit(ZRAM_PP_CANCELLED, &operation->state);
 }
 
 void zram_pp_operation_end(struct zram_pp_operation *operation)
@@ -179,7 +310,6 @@ void zram_pp_operation_end(struct zram_pp_operation *operation)
 	if (!operation)
 		return;
 	scheduler = operation->scheduler;
-
 	spin_lock_irqsave(&scheduler->lock, flags);
 	if (WARN_ON_ONCE(test_bit(ZRAM_PP_OPERATION_ENDED,
 				 &operation->state))) {
@@ -194,20 +324,6 @@ void zram_pp_operation_end(struct zram_pp_operation *operation)
 	zram_pp_operation_put(operation);
 }
 
-static void zram_pp_job_drop(struct zram_pp_job *job)
-{
-	struct zram_pp_operation *operation = job->operation;
-	int active_jobs;
-
-	active_jobs = atomic_dec_return(&operation->active_jobs);
-	if (WARN_ON_ONCE(active_jobs < 0))
-		active_jobs = 0;
-	if (!active_jobs)
-		zram_pp_operation_maybe_complete(operation);
-	zram_pp_operation_put(operation);
-	kfree(job);
-}
-
 struct zram_pp_job *zram_pp_job_claim_locked(struct zram *zram,
 					      struct zram_pp_operation *operation,
 					      u32 index, gfp_t gfp)
@@ -219,18 +335,18 @@ struct zram_pp_job *zram_pp_job_claim_locked(struct zram *zram,
 	if (zram_pp_operation_cancelled(operation) ||
 	    test_bit(ZRAM_PP_OPERATION_ENDED, &operation->state))
 		return ERR_PTR(-ECANCELED);
-	job = kzalloc(sizeof(*job), gfp);
+	job = zram_pp_job_alloc(scheduler, gfp);
 	if (!job)
-		return ERR_PTR(-ENOMEM);
-
-	INIT_LIST_HEAD(&job->entry);
-	job->operation = operation;
+		return ERR_PTR(-EAGAIN);
 	job->index = index;
+	job->type = operation->type;
+	job->priority = operation->priority;
 	job->generation = zram_rep_mutation_seq_locked(zram, index);
 	if (!zram_pp_operation_add_job(operation)) {
-		kfree(job);
+		zram_pp_job_drop(job);
 		return ERR_PTR(-ECANCELED);
 	}
+	job->operation = operation;
 
 	for (;;) {
 		current_job = xa_cmpxchg(&scheduler->slot_jobs, index, NULL,
@@ -241,17 +357,13 @@ struct zram_pp_job *zram_pp_job_claim_locked(struct zram *zram,
 		}
 		if (!current_job)
 			break;
-
 		if (!test_bit(ZRAM_PP_CANCELLED,
 			      &((struct zram_pp_job *)current_job)->state) &&
-		    !zram_pp_operation_cancelled(
-			    ((struct zram_pp_job *)current_job)->operation) &&
-		    ((struct zram_pp_job *)current_job)->operation->priority >=
-			    operation->priority) {
+		    ((struct zram_pp_job *)current_job)->priority >=
+				job->priority) {
 			zram_pp_job_drop(job);
 			return ERR_PTR(-EBUSY);
 		}
-
 		if (xa_cmpxchg(&scheduler->slot_jobs, index, current_job, job,
 			       gfp) == current_job) {
 			set_bit(ZRAM_PP_CANCELLED,
@@ -259,73 +371,211 @@ struct zram_pp_job *zram_pp_job_claim_locked(struct zram *zram,
 			break;
 		}
 	}
-
-	if (unlikely(zram_pp_operation_cancelled(operation))) {
-		zram_pp_cancel_slot_locked(zram, index);
-		zram_pp_job_drop(job);
-		return ERR_PTR(-ECANCELED);
-	}
 	return job;
 }
 
-bool zram_pp_job_is_current_locked(struct zram *zram,
-					   const struct zram_pp_job *job)
+int zram_pp_submit_latest(struct zram *zram, enum zram_pp_job_type type,
+			  enum zram_pp_priority priority, u32 index,
+			  u64 generation, zram_pp_job_fn run)
 {
-	struct zram_pp_scheduler *scheduler = job->operation->scheduler;
+	struct zram_pp_scheduler *scheduler = &zram->pp_scheduler;
+	struct workqueue_struct *wq;
+	struct zram_pp_job *job;
+	void *current;
 
+	if ((unsigned int)type >= ZRAM_PP_JOB_MAX || !run ||
+	    READ_ONCE(scheduler->stopping))
+		return -ESHUTDOWN;
+	zram_slot_lock(zram, index);
+	if (generation != zram_rep_mutation_seq_locked(zram, index)) {
+		zram_slot_unlock(zram, index);
+		return -ESTALE;
+	}
+	current = xa_load(&scheduler->slot_jobs, index);
+	if (current && !test_bit(ZRAM_PP_CANCELLED,
+				 &((struct zram_pp_job *)current)->state) &&
+	    ((struct zram_pp_job *)current)->type == type &&
+	    test_bit(ZRAM_PP_ASYNC,
+		     &((struct zram_pp_job *)current)->state)) {
+		WRITE_ONCE(((struct zram_pp_job *)current)->generation,
+			   generation);
+		zram_slot_unlock(zram, index);
+		return 0;
+	}
+	if (current) {
+		zram_slot_unlock(zram, index);
+		return -EBUSY;
+	}
+
+	job = zram_pp_job_alloc(scheduler, GFP_NOWAIT | __GFP_NOWARN);
+	if (!job) {
+		zram_slot_unlock(zram, index);
+		return -EAGAIN;
+	}
+	INIT_WORK(&job->work, zram_pp_async_work);
+	job->run = run;
+	job->index = index;
+	job->type = type;
+	job->priority = priority;
+	job->generation = generation;
+	set_bit(ZRAM_PP_ASYNC, &job->state);
+	current = xa_cmpxchg(&scheduler->slot_jobs, index, NULL, job,
+			     GFP_NOWAIT);
+	if (xa_is_err(current) || current) {
+		zram_pp_job_drop(job);
+		zram_slot_unlock(zram, index);
+		return xa_is_err(current) ? xa_err(current) : -EBUSY;
+	}
+	zram_slot_unlock(zram, index);
+
+	if (type == ZRAM_PP_PACKED_READ)
+		wq = scheduler->fault_wq;
+	else if (type == ZRAM_PP_WRITEBACK)
+		wq = scheduler->write_wq;
+	else
+		wq = scheduler->cpu_wq;
+	queue_work(wq, &job->work);
+	return 0;
+}
+
+bool zram_pp_job_is_current_locked(struct zram *zram,
+				   const struct zram_pp_job *job)
+{
 	return !test_bit(ZRAM_PP_CANCELLED, &job->state) &&
-	       !zram_pp_operation_cancelled(job->operation) &&
-	       xa_load(&scheduler->slot_jobs, job->index) == job &&
+	       (!job->operation ||
+		!zram_pp_operation_cancelled(job->operation)) &&
+	       xa_load(&job->scheduler->slot_jobs, job->index) == job &&
 	       zram_rep_mutation_seq_locked(zram, job->index) ==
-			job->generation;
+			READ_ONCE(job->generation);
+}
+
+static bool zram_pp_budget_add(u64 *used, u64 limit, u64 amount)
+{
+	u64 next;
+
+	if (check_add_overflow(*used, amount, &next) ||
+	    (limit && next > limit))
+		return false;
+	*used = next;
+	return true;
 }
 
 bool zram_pp_job_charge(struct zram_pp_job *job, u64 bytes)
 {
-	struct zram_pp_budget *budget = &job->operation->budget;
+	struct zram_pp_budget *budget;
 	unsigned long flags;
-	u64 next_pages;
-	u64 next_bytes;
+	bool logical;
 	bool charged = false;
 
 	if (test_bit(ZRAM_PP_CHARGED, &job->state))
 		return true;
+	if (!job->operation)
+		return true;
+	budget = &job->operation->budget;
 	spin_lock_irqsave(&budget->lock, flags);
-	if (test_bit(ZRAM_PP_CHARGED, &job->state)) {
-		charged = true;
-		goto out;
-	}
-	if (check_add_overflow(budget->used_pages, 1ULL, &next_pages))
-		goto out;
-	if (budget->max_pages && next_pages > budget->max_pages)
-		goto out;
-	if (check_add_overflow(budget->used_bytes, bytes, &next_bytes))
-		goto out;
-	if (budget->max_bytes && next_bytes > budget->max_bytes)
-		goto out;
-
-	budget->used_pages = next_pages;
-	budget->used_bytes = next_bytes;
-	job->charged_bytes = bytes;
-	set_bit(ZRAM_PP_CHARGED, &job->state);
-	charged = true;
-out:
+	logical = zram_pp_budget_add(&budget->logical_used,
+				     budget->logical_limit, 1);
+	if (logical)
+		charged = zram_pp_budget_add(&budget->resident_used,
+					     budget->resident_limit, bytes);
+	if (charged) {
+		job->charged_bytes = bytes;
+		set_bit(ZRAM_PP_CHARGED, &job->state);
+	} else if (logical)
+		budget->logical_used--;
 	spin_unlock_irqrestore(&budget->lock, flags);
 	return charged;
 }
 
-void zram_pp_job_finish_locked(struct zram *zram,
-				       struct zram_pp_job *job)
+bool zram_pp_operation_charge_scan(struct zram_pp_operation *operation,
+				   u64 slots)
 {
-	struct zram_pp_scheduler *scheduler;
-	void *current_job;
+	struct zram_pp_budget *budget = &operation->budget;
+	unsigned long flags;
+	bool charged;
+
+	spin_lock_irqsave(&budget->lock, flags);
+	charged = zram_pp_budget_add(&budget->scan_used,
+				     budget->scan_limit, slots);
+	spin_unlock_irqrestore(&budget->lock, flags);
+	return charged;
+}
+
+bool zram_pp_operation_charge_candidate(struct zram_pp_operation *operation)
+{
+	struct zram_pp_budget *budget = &operation->budget;
+	unsigned long flags;
+	bool charged;
+
+	spin_lock_irqsave(&budget->lock, flags);
+	charged = zram_pp_budget_add(&budget->candidates_used,
+				     budget->candidate_limit, 1);
+	spin_unlock_irqrestore(&budget->lock, flags);
+	return charged;
+}
+
+bool zram_pp_budget_reserve_physical(struct zram_pp_budget *budget,
+				     u64 blocks)
+{
+	unsigned long flags;
+	bool charged;
+
+	spin_lock_irqsave(&budget->lock, flags);
+	charged = zram_pp_budget_add(&budget->physical_reserved, 0, blocks);
+	spin_unlock_irqrestore(&budget->lock, flags);
+	return charged;
+}
+
+void zram_pp_budget_commit_physical(struct zram_pp_budget *budget,
+				    u64 blocks, bool gc)
+{
+	unsigned long flags;
+	u64 next;
+
+	spin_lock_irqsave(&budget->lock, flags);
+	WARN_ON_ONCE(budget->physical_reserved < blocks);
+	budget->physical_reserved -= min(budget->physical_reserved, blocks);
+	if (WARN_ON_ONCE(check_add_overflow(budget->physical_committed,
+					   blocks, &next)))
+		budget->physical_committed = U64_MAX;
+	else
+		budget->physical_committed = next;
+	if (gc) {
+		if (WARN_ON_ONCE(check_add_overflow(
+				budget->gc_physical_writes, blocks, &next)))
+			budget->gc_physical_writes = U64_MAX;
+		else
+			budget->gc_physical_writes = next;
+	}
+	spin_unlock_irqrestore(&budget->lock, flags);
+}
+
+void zram_pp_budget_rollback_physical(struct zram_pp_budget *budget,
+				      u64 blocks)
+{
+	unsigned long flags;
+	u64 next;
+
+	spin_lock_irqsave(&budget->lock, flags);
+	WARN_ON_ONCE(budget->physical_reserved < blocks);
+	budget->physical_reserved -= min(budget->physical_reserved, blocks);
+	if (WARN_ON_ONCE(check_add_overflow(budget->physical_rollback,
+					   blocks, &next)))
+		budget->physical_rollback = U64_MAX;
+	else
+		budget->physical_rollback = next;
+	spin_unlock_irqrestore(&budget->lock, flags);
+}
+
+void zram_pp_job_finish_locked(struct zram *zram, struct zram_pp_job *job)
+{
+	void *current;
 
 	if (!job || test_and_set_bit(ZRAM_PP_DONE, &job->state))
 		return;
-	scheduler = job->operation->scheduler;
-	current_job = xa_cmpxchg(&scheduler->slot_jobs, job->index, job, NULL,
-				 0);
-	WARN_ON_ONCE(xa_is_err(current_job));
+	current = xa_cmpxchg(&job->scheduler->slot_jobs, job->index, job,
+			     NULL, 0);
+	WARN_ON_ONCE(xa_is_err(current));
 	zram_pp_job_drop(job);
 }
 
@@ -344,4 +594,23 @@ bool zram_pp_slot_active_locked(struct zram *zram, u32 index)
 
 	job = xa_load(&zram->pp_scheduler.slot_jobs, index);
 	return job && !test_bit(ZRAM_PP_CANCELLED, &job->state);
+}
+
+bool zram_pp_io_get(struct zram_pp_scheduler *scheduler)
+{
+	if (READ_ONCE(scheduler->stopping))
+		return false;
+	atomic_inc(&scheduler->active_io);
+	if (unlikely(READ_ONCE(scheduler->stopping))) {
+		if (atomic_dec_and_test(&scheduler->active_io))
+			wake_up_all(&scheduler->wait);
+		return false;
+	}
+	return true;
+}
+
+void zram_pp_io_put(struct zram_pp_scheduler *scheduler)
+{
+	WARN_ON_ONCE(atomic_dec_return(&scheduler->active_io) < 0);
+	wake_up_all(&scheduler->wait);
 }

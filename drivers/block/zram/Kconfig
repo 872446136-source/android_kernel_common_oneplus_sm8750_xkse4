@@ -175,3 +175,65 @@ config ZRAM_MULTI_COMP
 	  re-compress pages using a potentially slower but more effective
 	  compression algorithm. Note, that IDLE page recompression
 	  requires ZRAM_TRACK_ENTRY_ACTIME.
+
+config ZRAM_ADAPTIVE_RECOMP
+	bool "Adaptive asynchronous zram recompression"
+	depends on ZRAM_MULTI_COMP
+	default n
+	help
+
+	  Recompress recently written objects asynchronously and commit only
+	  when the target allocator class is strictly smaller. This keeps the
+	  foreground write path on a fast compressor while allowing explicitly
+	  configured higher-ratio backends to run within bounded CPU budgets.
+
+config ZRAM_SDDC
+	bool "Codec-agnostic zram SDDC representations"
+	depends on ZRAM
+	select LZ4KD_DELTA
+	default n
+	help
+
+	  Enable bounded exact deduplication and one-level reference/delta
+	  representations above the ordinary compression backends. References
+	  are immutable and owner-isolated, and all asynchronous publication is
+	  guarded by slot generation and reference cookie validation.
+
+config ZRAM_REP_ENGINE
+	bool
+	default y if ZRAM_ADAPTIVE_RECOMP || ZRAM_SDDC
+	select LZ4KD_DELTA
+
+config ZRAM_PACKED_WRITEBACK
+	bool "Packed zram writeback"
+	depends on ZRAM_WRITEBACK
+	select LZ4KD_DELTA
+	default n
+	help
+
+	  Pack multiple compressed objects into immutable backing pages while
+	  retaining legacy page-granular writeback as a fallback. Packed reads
+	  fetch one backing page, validate its bounded directory and checksum,
+	  and transiently coalesce concurrent readers of the same pack.
+
+config ZRAM_SDDC_NATIVE_WRITEBACK
+	bool "Native SDDC packed writeback"
+	depends on ZRAM_SDDC && ZRAM_PACKED_WRITEBACK
+	default n
+	help
+
+	  Preserve SDDC reference and delta representations in packed backing
+	  objects instead of flattening them before writeback. Reference cookies,
+	  backing pins and integrity data remain valid independently of the slot
+	  that originally supplied the reference payload.
+
+config ZRAM_PWB_GC
+	bool "Packed zram writeback copy-forward GC"
+	depends on ZRAM_PACKED_WRITEBACK
+	default n
+	help
+
+	  Reclaim dead space from immutable packs using cancellable copy-forward
+	  relocation subject to the physical write budget. Live objects are
+	  revalidated per slot before their new locators are published; old packs
+	  are released only after both live-object and reader counts reach zero.
