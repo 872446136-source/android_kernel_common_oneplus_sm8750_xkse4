@@ -4,18 +4,24 @@ set -e
 
 echo "==== ReSukiSU install ===="
 
+
 if [ -d KernelSU ]; then
     rm -rf KernelSU
 fi
 
+
 git clone --depth=1 \
-https://github.com/5ec1cff/KernelSU.git \
+https://github.com/rsuntk/KernelSU.git \
 KernelSU
 
-cd KernelSU
 
-bash setup.sh
+echo "KernelSU cloned"
 
-cd ..
 
-echo "ReSukiSU done"
+echo "Applying KernelSU"
+
+
+cp -r KernelSU/* .
+
+
+echo "ReSukiSU setup done"
