@@ -1043,7 +1043,7 @@ static void release_wb_req(struct zram_wb_req *req)
 		WARN_ON_ONCE(entry->blk_idx);
 		WARN_ON_ONCE(entry->index);
 		WARN_ON_ONCE(entry->txn.target_ext);
-		WARN_ON_ONCE(entry->txn.xa_reserved);
+		WARN_ON_ONCE(entry->txn.xa_reservation);
 		if (entry->page)
 			__free_page(entry->page);
 	}
@@ -2077,7 +2077,15 @@ static void zram_async_read_endio(struct bio *bio)
 	}
 
 	INIT_WORK(&req->work, zram_deferred_decompress);
-	queue_work(zram->pp_scheduler.fault_wq, &req->work);
+	if (WARN_ON_ONCE(!queue_work(zram->pp_scheduler.fault_wq,
+				     &req->work))) {
+		memzero_page(req->page, 0, PAGE_SIZE);
+		req->parent->bi_status = BLK_STS_IOERR;
+		bio_endio(req->parent);
+		bio_put(bio);
+		kfree(req);
+		zram_readback_put(zram);
+	}
 }
 
 static int read_from_bdev_async(struct zram *zram, struct page *page,
@@ -2151,10 +2159,19 @@ static int read_from_bdev_sync(struct zram *zram, struct page *page,
 	int ret;
 
 	INIT_WORK_ONSTACK(&req.work, zram_sync_read);
-	if (!zram_pp_io_get(&zram->pp_scheduler))
+	if (!zram_pp_io_get(&zram->pp_scheduler)) {
+		destroy_work_on_stack(&req.work);
+		memzero_page(page, 0, PAGE_SIZE);
 		return -ESHUTDOWN;
+	}
 	atomic_inc(&zram->rb_inflight);
-	queue_work(zram->pp_scheduler.fault_wq, &req.work);
+	if (WARN_ON_ONCE(!queue_work(zram->pp_scheduler.fault_wq,
+				     &req.work))) {
+		destroy_work_on_stack(&req.work);
+		memzero_page(page, 0, PAGE_SIZE);
+		zram_readback_put(zram);
+		return -EIO;
+	}
 	flush_work(&req.work);
 	destroy_work_on_stack(&req.work);
 
@@ -2205,8 +2222,6 @@ static int read_from_bdev(struct zram *zram, struct page *page,
 {
 	return -EIO;
 }
-
-static void free_block_bdev(struct zram *zram, unsigned long blk_idx) {};
 #endif
 
 #ifdef CONFIG_ZRAM_MEMORY_TRACKING

@@ -4,6 +4,7 @@
 
 #include <linux/atomic.h>
 #include <linux/errno.h>
+#include <linux/mempool.h>
 #include <linux/mutex.h>
 #include <linux/spinlock.h>
 #include <linux/types.h>
@@ -74,6 +75,8 @@ struct zram_engine_stats {
 struct zram_engine {
 	atomic_t adaptive_state;
 	atomic_t sddc_state;
+	/* Serializes sysfs, drain and teardown state transitions. */
+	struct mutex state_lock;
 	u8 adaptive_resume_state;
 	u8 sddc_resume_state;
 	spinlock_t index_lock;
@@ -83,6 +86,8 @@ struct zram_engine {
 	u8 sample_hand[ZRAM_SDDC_BUCKETS];
 	struct xarray references;
 	struct mutex reference_lock;
+	mempool_t *delta_page_pool;
+	mempool_t *delta_scratch_pool;
 	spinlock_t pin_lock;
 	u32 next_reference_id;
 	u32 reference_generation;

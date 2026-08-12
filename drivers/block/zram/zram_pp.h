@@ -68,6 +68,7 @@ struct zram_pp_scheduler {
 	wait_queue_head_t wait;
 	atomic64_t next_id;
 	atomic_t active_operations;
+	atomic_t active_producers;
 	atomic_t pending_jobs;
 	atomic_t active_io;
 	unsigned long active_types;

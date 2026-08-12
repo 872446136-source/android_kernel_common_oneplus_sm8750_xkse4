@@ -5,10 +5,10 @@
 #include <linux/kernel.h>
 #include <linux/lz4kd.h>
 #include <linux/mm.h>
+#include <linux/module.h>
 #include <linux/overflow.h>
 #include <linux/slab.h>
 #include <linux/string.h>
-#include <linux/unaligned.h>
 
 struct lz4kd_delta_run {
 	__le16 offset;
@@ -279,3 +279,6 @@ int lz4kd_delta_decode(struct lz4kd_delta_ctx *ctx,
 	return 0;
 }
 EXPORT_SYMBOL_GPL(lz4kd_delta_decode);
+
+MODULE_LICENSE("GPL");
+MODULE_DESCRIPTION("Private LZ4KD page delta codec");

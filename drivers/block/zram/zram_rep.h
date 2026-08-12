@@ -73,7 +73,7 @@ struct zram_slot_txn {
 	u8 target_codec_id;
 	u16 target_codec_generation;
 	u8 state;
-	bool xa_reserved;
+	void *xa_reservation;
 };
 
 typedef void (*zram_slot_publish_t)(struct zram *zram, u32 index,
@@ -108,6 +108,13 @@ int zram_slot_txn_commit_if_current_locked(struct zram *zram,
 					   struct zram_slot_txn *txn,
 					   zram_slot_publish_t publish,
 					   void *private);
+int zram_slot_txn_commit_pair_if_current_locked(struct zram *zram,
+						struct zram_slot_txn *first,
+						zram_slot_publish_t first_publish,
+						void *first_private,
+						struct zram_slot_txn *second,
+						zram_slot_publish_t second_publish,
+						void *second_private);
 void zram_slot_txn_abort(struct zram *zram, struct zram_slot_txn *txn);
 
 #endif /* _ZRAM_REP_H_ */

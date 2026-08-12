@@ -17,6 +17,7 @@
 #define ZRAM_PWB_MAX_OBJECTS	32U
 #define ZRAM_PWB_MAX_BATCH	16U
 #define ZRAM_PWB_DEFAULT_GC_DEAD	50U
+#define ZRAM_PWB_ID_PROBES	64U
 
 enum zram_pwb_object_kind {
 	ZRAM_PWB_OBJECT_COMPRESSED = 1,
@@ -67,6 +68,7 @@ struct zram_pwb_pack {
 	u32 used_bytes;
 	atomic_t live_objects;
 	atomic_t readers;
+	atomic_t publishers;
 	atomic_long_t live_bytes;
 	atomic_long_t dead_bytes;
 	bool in_table;
@@ -196,6 +198,7 @@ static void zram_pwb_pack_put(struct zram_pwb_pack *pack)
 		WARN_ON_ONCE(pack->in_table);
 		WARN_ON_ONCE(atomic_read(&pack->live_objects));
 		WARN_ON_ONCE(atomic_read(&pack->readers));
+		WARN_ON_ONCE(atomic_read(&pack->publishers));
 		if (pack->xa_reserved)
 			xa_release(&pack->zram->pwb.packs, pack->id);
 		if (pack->block)
@@ -207,15 +210,18 @@ static void zram_pwb_pack_put(struct zram_pwb_pack *pack)
 static void zram_pwb_pack_try_reap(struct zram_pwb_pack *pack)
 {
 	struct zram *zram = pack->zram;
+	XA_STATE(xas, &zram->pwb.packs, pack->id);
 	bool removed = false;
 
-	if (atomic_read(&pack->live_objects) || atomic_read(&pack->readers))
+	if (atomic_read(&pack->live_objects) || atomic_read(&pack->readers) ||
+	    atomic_read(&pack->publishers))
 		return;
 	mutex_lock(&zram->pwb.pack_lock);
 	xa_lock(&zram->pwb.packs);
 	if (!atomic_read(&pack->live_objects) &&
 	    !atomic_read(&pack->readers) &&
-	    __xa_load(&zram->pwb.packs, pack->id) == pack) {
+	    !atomic_read(&pack->publishers) &&
+	    xas_load(&xas) == pack) {
 		__xa_erase(&zram->pwb.packs, pack->id);
 		WRITE_ONCE(pack->in_table, false);
 		removed = true;
@@ -229,6 +235,14 @@ static void zram_pwb_pack_try_reap(struct zram_pwb_pack *pack)
 		atomic64_sub(PAGE_SIZE, &zram->pwb.stats.physical_bytes);
 		zram_pwb_pack_put(pack);
 	}
+}
+
+static void zram_pwb_publish_done(struct zram_pwb_pack *pack)
+{
+	/* Keep an explicit publisher reference across the last-slot reap race. */
+	WARN_ON_ONCE(atomic_dec_return(&pack->publishers) < 0);
+	zram_pwb_pack_try_reap(pack);
+	zram_pwb_pack_put(pack);
 }
 
 static void zram_pwb_ext_release(struct zram *zram,
@@ -546,7 +560,7 @@ static int zram_pwb_capture(struct zram *zram,
 	    type == ZRAM_REP_BACKING || type == ZRAM_REP_PACKED_BACKING ||
 	    ((mode & BIT(0)) && !(zram->table[index].attr.flags &
 				    BIT(ZRAM_IDLE)))) {
-		ret = -EAGAIN;
+		ret = -ENODATA;
 		goto out_unlock;
 	}
 	if (!zram_pp_operation_charge_candidate(operation)) {
@@ -673,6 +687,8 @@ static struct zram_pwb_pack *zram_pwb_pack_alloc(struct zram *zram,
 						  u32 used_bytes)
 {
 	struct zram_pwb_pack *pack;
+	u32 probes;
+	int ret;
 
 	pack = kzalloc(sizeof(*pack), GFP_NOIO | __GFP_NOWARN);
 	if (!pack)
@@ -683,16 +699,23 @@ static struct zram_pwb_pack *zram_pwb_pack_alloc(struct zram *zram,
 	pack->used_bytes = used_bytes;
 	pack->created_ns = ktime_get_ns();
 	mutex_lock(&zram->pwb.pack_lock);
-	pack->id = zram->pwb.next_pack_id++;
-	if (unlikely(!pack->id)) {
-		zram->pwb.pack_generation++;
-		if (!zram->pwb.pack_generation)
-			zram->pwb.pack_generation++;
+	for (probes = 0; probes < ZRAM_PWB_ID_PROBES; probes++) {
 		pack->id = zram->pwb.next_pack_id++;
+		if (unlikely(!pack->id)) {
+			zram->pwb.pack_generation++;
+			if (!zram->pwb.pack_generation)
+				zram->pwb.pack_generation++;
+			pack->id = zram->pwb.next_pack_id++;
+		}
+		ret = xa_insert(&zram->pwb.packs, pack->id, NULL, GFP_NOIO);
+		if (ret != -EBUSY)
+			break;
 	}
+	if (probes == ZRAM_PWB_ID_PROBES)
+		ret = -ENOSPC;
 	pack->generation = zram->pwb.pack_generation;
 	mutex_unlock(&zram->pwb.pack_lock);
-	if (xa_reserve(&zram->pwb.packs, pack->id, GFP_NOIO)) {
+	if (ret) {
 		kfree(pack);
 		return NULL;
 	}
@@ -741,9 +764,16 @@ static int zram_pwb_submit(struct zram *zram,
 
 	init_completion(&io.done);
 	INIT_WORK_ONSTACK(&io.work, zram_pwb_write_work);
-	if (!zram_pp_io_get(&zram->pp_scheduler))
+	if (!zram_pp_io_get(&zram->pp_scheduler)) {
+		destroy_work_on_stack(&io.work);
 		return -ESHUTDOWN;
-	queue_work(zram->pp_scheduler.write_wq, &io.work);
+	}
+	if (WARN_ON_ONCE(!queue_work(zram->pp_scheduler.write_wq,
+				     &io.work))) {
+		zram_pp_io_put(&zram->pp_scheduler);
+		destroy_work_on_stack(&io.work);
+		return -EBUSY;
+	}
 	wait_for_completion(&io.done);
 	destroy_work_on_stack(&io.work);
 	*submitted = io.submitted;
@@ -797,20 +827,34 @@ static void zram_pwb_publish_relocation(struct zram *zram, u32 index,
 static int zram_pwb_insert_pack(struct zram *zram,
 				struct zram_pwb_pack *pack)
 {
+	XA_STATE(xas, &zram->pwb.packs, pack->id);
 	void *stored;
+	int ret = 0;
 
 	mutex_lock(&zram->pwb.pack_lock);
-	stored = xa_cmpxchg(&zram->pwb.packs, pack->id, XA_ZERO_ENTRY, pack,
-			   GFP_KERNEL);
-	if (stored == XA_ZERO_ENTRY)
+	atomic_inc(&pack->publishers);
+	/* The builder owns one reference here, so this cannot fail. */
+	refcount_inc(&pack->refs);
+	xa_lock(&zram->pwb.packs);
+	stored = xas_load(&xas);
+	if (stored != XA_ZERO_ENTRY) {
+		ret = -EEXIST;
+	} else {
+		xas_store(&xas, pack);
+		ret = xas_error(&xas);
+	}
+	xa_unlock(&zram->pwb.packs);
+	if (!ret)
 		WRITE_ONCE(pack->in_table, true);
-	if (pack->in_table)
+	if (pack->in_table) {
 		pack->xa_reserved = false;
+	} else {
+		WARN_ON_ONCE(atomic_dec_return(&pack->publishers) < 0);
+		zram_pwb_pack_put(pack);
+	}
 	mutex_unlock(&zram->pwb.pack_lock);
-	if (xa_is_err(stored))
-		return xa_err(stored);
-	if (stored != XA_ZERO_ENTRY)
-		return -EEXIST;
+	if (ret)
+		return ret;
 	atomic64_inc(&zram->pwb.stats.packs);
 	atomic64_add(PAGE_SIZE, &zram->pwb.stats.physical_bytes);
 	return 0;
@@ -877,7 +921,7 @@ stale:
 				&pack->dead_bytes);
 		zram_pwb_abort_object(zram, object);
 	}
-	zram_pwb_pack_try_reap(pack);
+	zram_pwb_publish_done(pack);
 	return 0;
 }
 
@@ -944,15 +988,22 @@ ssize_t zram_pwb_writeback(struct zram *zram, const char *buf, size_t len)
 		ret = zram_pwb_capture(zram, operation, index, mode, wire,
 				       &candidate);
 		if (ret) {
-			if (ret == -EOPNOTSUPP || ret == -ENOSPC) {
-				fallback_needed = true;
-				atomic64_inc(&zram->pwb.stats.fallback);
-			} else if (ret == -EDQUOT) {
+			if (ret == -ENODATA || ret == -ESTALE || ret == -EBUSY)
+				continue;
+			if (ret == -EAGAIN) {
 				fallback_needed = true;
 				atomic64_inc(&zram->pwb.stats.fallback);
 				break;
 			}
-			continue;
+			if (ret == -EOPNOTSUPP || ret == -ENOSPC ||
+			    ret == -ENOMEM || ret == -EDQUOT) {
+				fallback_needed = true;
+				atomic64_inc(&zram->pwb.stats.fallback);
+				if (ret == -ENOMEM || ret == -EDQUOT)
+					break;
+				continue;
+			}
+			break;
 		}
 		builder = zram_pwb_best_builder(builders, max_packs,
 						candidate.wire_size);
@@ -964,6 +1015,11 @@ ssize_t zram_pwb_writeback(struct zram *zram, const char *buf, size_t len)
 		}
 		zram_pwb_add_object(builder, &candidate, wire);
 	}
+	if (ret && ret != -ENODATA && ret != -EAGAIN && ret != -ESTALE &&
+	    ret != -EBUSY &&
+	    ret != -EOPNOTSUPP && ret != -ENOSPC && ret != -ENOMEM &&
+	    ret != -EDQUOT)
+		goto out;
 	for (i = 0; i < max_packs; i++)
 		if (builders[i].object_count)
 			nr_packs++;
@@ -1018,8 +1074,13 @@ ssize_t zram_pwb_writeback(struct zram *zram, const char *buf, size_t len)
 		atomic64_add(nr_packs, &zram->stats.bd_writes);
 		atomic64_add(nr_packs, &zram->pwb.stats.physical_writes);
 	}
-	if (ret)
+	if (ret) {
+		if (!write_submitted && ret != -ESHUTDOWN && ret != -ECANCELED) {
+			atomic64_inc(&zram->pwb.stats.fallback);
+			ret = -EOPNOTSUPP;
+		}
 		goto rollback_blocks;
+	}
 	if (WARN_ON_ONCE(!write_submitted)) {
 		ret = -EIO;
 		goto rollback_blocks;
@@ -1163,7 +1224,16 @@ zram_pwb_cache_get(struct zram_pwb_pack *pack)
 	if (xa_is_err(stored) || stored)
 		goto fail_token;
 	mutex_unlock(&zram->pwb.read_lock);
-	queue_work(zram->pp_scheduler.fault_wq, &cache->work);
+	if (WARN_ON_ONCE(!queue_work(zram->pp_scheduler.fault_wq,
+				     &cache->work))) {
+		mutex_lock(&zram->pwb.read_lock);
+		xa_cmpxchg(&zram->pwb.read_cache, pack->id, cache, NULL, 0);
+		mutex_unlock(&zram->pwb.read_lock);
+		cache->error = -EIO;
+		zram_pp_io_put(&zram->pp_scheduler);
+		complete_all(&cache->done);
+		zram_pwb_cache_put(cache); /* worker reference */
+	}
 	return cache;
 
 fail_token:
@@ -1380,24 +1450,37 @@ ssize_t zram_pwb_state_store(struct zram *zram, const char *buf, size_t len)
 	unsigned long nr_slots;
 	u32 index;
 	bool remaining = false;
+	ssize_t result = len;
 
+	mutex_lock(&zram->pwb.state_lock);
+	if (atomic_read(&zram->pwb.state) == ZRAM_FEATURE_QUIESCING ||
+	    READ_ONCE(zram->pp_scheduler.stopping)) {
+		result = -ESHUTDOWN;
+		goto out;
+	}
 	if (sysfs_streq(buf, "1") || sysfs_streq(buf, "enabled")) {
 		if (PAGE_SIZE != LZ4KD_DELTA_PAGE_SIZE)
-			return -EOPNOTSUPP;
-		atomic_set(&zram->pwb.state, ZRAM_FEATURE_ENABLED);
+			result = -EOPNOTSUPP;
+		else
+			atomic_set(&zram->pwb.state, ZRAM_FEATURE_ENABLED);
 	} else if (sysfs_streq(buf, "0") || sysfs_streq(buf, "disabled"))
 		atomic_set(&zram->pwb.state, ZRAM_FEATURE_DRAINING);
 	else if (sysfs_streq(buf, "drain")) {
 		atomic_set(&zram->pwb.state, ZRAM_FEATURE_DRAINING);
 		operation = zram_pp_operation_begin(&zram->pp_scheduler,
 			ZRAM_PP_WRITEBACK, ZRAM_PP_PRIO_NORMAL, 0, 0);
-		if (IS_ERR(operation))
-			return PTR_ERR(operation);
+		if (IS_ERR(operation)) {
+			result = PTR_ERR(operation);
+			operation = NULL;
+			goto out;
+		}
 		flush_workqueue(zram->pp_scheduler.write_wq);
 		page = alloc_page(GFP_KERNEL | __GFP_NOWARN);
 		if (!page) {
 			zram_pp_operation_end(operation);
-			return -ENOMEM;
+			operation = NULL;
+			result = -ENOMEM;
+			goto out;
 		}
 		nr_slots = zram->disksize >> PAGE_SHIFT;
 		for (index = 0; index < nr_slots; index++) {
@@ -1429,10 +1512,12 @@ ssize_t zram_pwb_state_store(struct zram *zram, const char *buf, size_t len)
 		if (!remaining)
 			atomic_set(&zram->pwb.state, ZRAM_FEATURE_DISABLED);
 		else
-			return -EBUSY;
+			result = -EBUSY;
 	} else
-		return -EINVAL;
-	return len;
+		result = -EINVAL;
+out:
+	mutex_unlock(&zram->pwb.state_lock);
+	return result;
 }
 
 ssize_t zram_pwb_native_state_show(struct zram *zram, char *buf)
@@ -1444,17 +1529,30 @@ ssize_t zram_pwb_native_state_show(struct zram *zram, char *buf)
 ssize_t zram_pwb_native_state_store(struct zram *zram, const char *buf,
 				    size_t len)
 {
+	ssize_t ret = len;
+
 	if (!IS_ENABLED(CONFIG_ZRAM_SDDC_NATIVE_WRITEBACK))
 		return -EOPNOTSUPP;
+	mutex_lock(&zram->pwb.state_lock);
+	if (atomic_read(&zram->pwb.native_state) ==
+	    ZRAM_FEATURE_QUIESCING ||
+	    READ_ONCE(zram->pp_scheduler.stopping)) {
+		ret = -ESHUTDOWN;
+		goto out;
+	}
 	if (sysfs_streq(buf, "1") || sysfs_streq(buf, "enabled")) {
 		if (PAGE_SIZE != LZ4KD_DELTA_PAGE_SIZE)
-			return -EOPNOTSUPP;
-		atomic_set(&zram->pwb.native_state, ZRAM_FEATURE_ENABLED);
+			ret = -EOPNOTSUPP;
+		else
+			atomic_set(&zram->pwb.native_state,
+				   ZRAM_FEATURE_ENABLED);
 	} else if (sysfs_streq(buf, "0") || sysfs_streq(buf, "disabled"))
 		atomic_set(&zram->pwb.native_state, ZRAM_FEATURE_DRAINING);
 	else
-		return -EINVAL;
-	return len;
+		ret = -EINVAL;
+out:
+	mutex_unlock(&zram->pwb.state_lock);
+	return ret;
 }
 
 ssize_t zram_pwb_gc_state_show(struct zram *zram, char *buf)
@@ -1466,17 +1564,28 @@ ssize_t zram_pwb_gc_state_show(struct zram *zram, char *buf)
 ssize_t zram_pwb_gc_state_store(struct zram *zram, const char *buf,
 				size_t len)
 {
+	ssize_t ret = len;
+
 	if (!IS_ENABLED(CONFIG_ZRAM_PWB_GC))
 		return -EOPNOTSUPP;
+	mutex_lock(&zram->pwb.state_lock);
+	if (atomic_read(&zram->pwb.gc_state) == ZRAM_FEATURE_QUIESCING ||
+	    READ_ONCE(zram->pp_scheduler.stopping)) {
+		ret = -ESHUTDOWN;
+		goto out;
+	}
 	if (sysfs_streq(buf, "1") || sysfs_streq(buf, "enabled")) {
 		if (PAGE_SIZE != LZ4KD_DELTA_PAGE_SIZE)
-			return -EOPNOTSUPP;
-		atomic_set(&zram->pwb.gc_state, ZRAM_FEATURE_ENABLED);
+			ret = -EOPNOTSUPP;
+		else
+			atomic_set(&zram->pwb.gc_state, ZRAM_FEATURE_ENABLED);
 	} else if (sysfs_streq(buf, "0") || sysfs_streq(buf, "disabled"))
 		atomic_set(&zram->pwb.gc_state, ZRAM_FEATURE_DRAINING);
 	else
-		return -EINVAL;
-	return len;
+		ret = -EINVAL;
+out:
+	mutex_unlock(&zram->pwb.state_lock);
+	return ret;
 }
 
 ssize_t zram_pwb_stats_show(struct zram *zram, char *buf)
@@ -1650,19 +1759,19 @@ stale:
 				&pack->dead_bytes);
 		zram_pwb_abort_object(zram, object);
 	}
-	zram_pwb_pack_try_reap(pack);
+	zram_pwb_publish_done(pack);
 	return 0;
 }
 
 static ssize_t zram_pwb_gc_execute(struct zram *zram, const char *buf,
 				    size_t len)
 {
+	XA_STATE(xas, &zram->pwb.packs, 0);
 	struct zram_pwb_pack **inputs = NULL;
 	struct zram_pwb_pack *iter_pack;
-	struct zram_pwb_builder builder = { };
+	struct zram_pwb_builder *builder = NULL;
 	struct zram_pp_operation *operation = NULL;
 	unsigned long block = 0;
-	unsigned long id;
 	void *copy = NULL;
 	u32 max_packs = 1;
 	u32 selected = 0;
@@ -1679,12 +1788,17 @@ static ssize_t zram_pwb_gc_execute(struct zram *zram, const char *buf,
 	max_packs = clamp_t(u32, max_packs, 1, ZRAM_PWB_MAX_BATCH);
 	inputs = kcalloc(max_packs, sizeof(*inputs), GFP_KERNEL);
 	copy = kmalloc(PAGE_SIZE, GFP_KERNEL);
-	builder.page = alloc_page(GFP_KERNEL | __GFP_NOWARN);
-	if (!inputs || !copy || !builder.page) {
+	builder = kzalloc(sizeof(*builder), GFP_KERNEL);
+	if (!inputs || !copy || !builder) {
 		ret = -ENOMEM;
 		goto out;
 	}
-	clear_highpage(builder.page);
+	builder->page = alloc_page(GFP_KERNEL | __GFP_NOWARN);
+	if (!builder->page) {
+		ret = -ENOMEM;
+		goto out;
+	}
+	clear_highpage(builder->page);
 	operation = zram_pp_operation_begin(&zram->pp_scheduler, ZRAM_PP_GC,
 					    ZRAM_PP_PRIO_LOW, 0, 0);
 	if (IS_ERR(operation)) {
@@ -1693,20 +1807,28 @@ static ssize_t zram_pwb_gc_execute(struct zram *zram, const char *buf,
 		goto out;
 	}
 	mutex_lock(&zram->pwb.pack_lock);
-	xa_for_each(&zram->pwb.packs, id, iter_pack) {
-		struct zram_pwb_pack *pack = iter_pack;
-		u64 live = atomic_long_read(&pack->live_bytes);
-		u64 live_limit = (u64)pack->used_bytes *
-			(100 - zram->pwb.gc_dead_percent);
+	xa_lock(&zram->pwb.packs);
+	xas_for_each(&xas, iter_pack, ULONG_MAX) {
+		struct zram_pwb_pack *pack;
+		u64 live;
+		u64 live_limit;
 
+		if (xa_is_zero(iter_pack))
+			continue;
+		pack = iter_pack;
+		live = atomic_long_read(&pack->live_bytes);
+		live_limit = (u64)pack->used_bytes *
+			(100 - zram->pwb.gc_dead_percent);
 		if (selected >= max_packs)
 			break;
 		if (!pack->used_bytes || atomic_read(&pack->readers) ||
+		    atomic_read(&pack->publishers) ||
 		    ktime_get_ns() - pack->created_ns < NSEC_PER_SEC ||
 		    live * 100 > live_limit || !zram_pwb_pack_get(pack))
 			continue;
 		inputs[selected++] = pack;
 	}
+	xa_unlock(&zram->pwb.packs);
 	mutex_unlock(&zram->pwb.pack_lock);
 	for (i = 0; i < selected; i++) {
 		struct zram_pwb_cache *cache;
@@ -1739,19 +1861,19 @@ static ssize_t zram_pwb_gc_execute(struct zram *zram, const char *buf,
 			u32 offset = le16_to_cpu(directory[ordinal].offset);
 			u32 length = le16_to_cpu(directory[ordinal].length);
 
-			if (builder.object_count >= ZRAM_PWB_MAX_OBJECTS ||
+			if (builder->object_count >= ZRAM_PWB_MAX_OBJECTS ||
 			    length > PAGE_SIZE - ZRAM_PWB_DATA_OFFSET -
-					 builder.payload_bytes)
+					 builder->payload_bytes)
 				break;
 			zram_pwb_gc_capture(zram, operation, inputs[i],
 				&directory[ordinal], ordinal, copy + offset,
-				&builder);
+				builder);
 		}
 		atomic64_inc(&zram->pwb.stats.gc_input_packs);
-		if (builder.object_count >= ZRAM_PWB_MAX_OBJECTS)
+		if (builder->object_count >= ZRAM_PWB_MAX_OBJECTS)
 			break;
 	}
-	if (!builder.object_count)
+	if (!builder->object_count)
 		goto out;
 	if (zram_pp_operation_cancelled(operation)) {
 		ret = -ECANCELED;
@@ -1774,21 +1896,22 @@ static ssize_t zram_pwb_gc_execute(struct zram *zram, const char *buf,
 		ret = -ENOSPC;
 		goto out;
 	}
-	builder.pack = zram_pwb_pack_alloc(zram, block,
-		builder.payload_bytes + builder.object_count *
-			sizeof(struct zram_pwb_directory));
-	if (!builder.pack) {
+	builder->pack = zram_pwb_pack_alloc(zram, block,
+					    builder->payload_bytes +
+					    builder->object_count *
+					    sizeof(struct zram_pwb_directory));
+	if (!builder->pack) {
 		ret = -ENOMEM;
 		goto rollback;
 	}
-	zram_pwb_fill_header(&builder);
+	zram_pwb_fill_header(builder);
 	if (zram_pp_operation_cancelled(operation) ||
 	    atomic_read(&zram->pwb.state) != ZRAM_FEATURE_ENABLED ||
 	    atomic_read(&zram->pwb.gc_state) != ZRAM_FEATURE_ENABLED) {
 		ret = -ECANCELED;
 		goto rollback;
 	}
-	ret = zram_pwb_submit(zram, &builder, 1, block, &write_submitted);
+	ret = zram_pwb_submit(zram, builder, 1, block, &write_submitted);
 	if (write_submitted) {
 		zram_pp_budget_commit_physical(&operation->budget, 1, true);
 		atomic64_inc(&zram->stats.bd_writes);
@@ -1801,7 +1924,7 @@ static ssize_t zram_pwb_gc_execute(struct zram *zram, const char *buf,
 		ret = -EIO;
 		goto rollback;
 	}
-	ret = zram_pwb_publish_gc_pack(zram, &builder);
+	ret = zram_pwb_publish_gc_pack(zram, builder);
 	if (ret)
 		goto written_unpublished;
 	atomic64_inc(&zram->pwb.stats.gc_output_packs);
@@ -1815,25 +1938,28 @@ rollback:
 		zram_backing_write_rollback(zram, 1);
 	}
 written_unpublished:
-	if (builder.pack) {
-		zram_pwb_pack_put(builder.pack);
-		builder.pack = NULL;
+	if (builder->pack) {
+		zram_pwb_pack_put(builder->pack);
+		builder->pack = NULL;
 		block = 0;
 	} else if (block) {
 		zram_backing_free(zram, block, 1);
 		block = 0;
 	}
 out:
-	for (i = 0; i < builder.object_count; i++)
-		zram_pwb_abort_object(zram, &builder.objects[i]);
+	if (builder) {
+		for (i = 0; i < builder->object_count; i++)
+			zram_pwb_abort_object(zram, &builder->objects[i]);
+		if (builder->page)
+			__free_page(builder->page);
+	}
 	if (inputs) {
 		for (i = 0; i < selected; i++)
 			zram_pwb_pack_put(inputs[i]);
 	}
 	if (operation)
 		zram_pp_operation_end(operation);
-	if (builder.page)
-		__free_page(builder.page);
+	kfree(builder);
 	kfree(copy);
 	kfree(inputs);
 	return ret;
@@ -1860,8 +1986,10 @@ ssize_t zram_pwb_gc_run(struct zram *zram, const char *buf, size_t len)
 
 	init_completion(&request.done);
 	INIT_WORK_ONSTACK(&request.work, zram_pwb_gc_work);
-	if (!zram_pp_io_get(&zram->pp_scheduler))
+	if (!zram_pp_io_get(&zram->pp_scheduler)) {
+		destroy_work_on_stack(&request.work);
 		return -ESHUTDOWN;
+	}
 	if (WARN_ON_ONCE(!queue_work(zram->pp_scheduler.cpu_wq,
 				    &request.work))) {
 		zram_pp_io_put(&zram->pp_scheduler);
@@ -1883,6 +2011,7 @@ int zram_pwb_init(struct zram *zram)
 	atomic_set(&zram->pwb.gc_state, ZRAM_FEATURE_DISABLED);
 	xa_init(&zram->pwb.packs);
 	xa_init(&zram->pwb.read_cache);
+	mutex_init(&zram->pwb.state_lock);
 	mutex_init(&zram->pwb.pack_lock);
 	mutex_init(&zram->pwb.read_lock);
 	zram->pwb.next_pack_id = 1;
@@ -1893,6 +2022,7 @@ int zram_pwb_init(struct zram *zram)
 
 void zram_pwb_quiesce(struct zram *zram)
 {
+	mutex_lock(&zram->pwb.state_lock);
 	if (atomic_read(&zram->pwb.state) != ZRAM_FEATURE_QUIESCING)
 		zram->pwb.resume_state = atomic_read(&zram->pwb.state);
 	if (atomic_read(&zram->pwb.native_state) != ZRAM_FEATURE_QUIESCING)
@@ -1903,10 +2033,12 @@ void zram_pwb_quiesce(struct zram *zram)
 	atomic_set(&zram->pwb.state, ZRAM_FEATURE_QUIESCING);
 	atomic_set(&zram->pwb.native_state, ZRAM_FEATURE_QUIESCING);
 	atomic_set(&zram->pwb.gc_state, ZRAM_FEATURE_QUIESCING);
+	mutex_unlock(&zram->pwb.state_lock);
 }
 
 void zram_pwb_resume(struct zram *zram)
 {
+	mutex_lock(&zram->pwb.state_lock);
 	if (!zram->disksize) {
 		atomic_set(&zram->pwb.state, ZRAM_FEATURE_DISABLED);
 		atomic_set(&zram->pwb.native_state, ZRAM_FEATURE_DISABLED);
@@ -1917,19 +2049,34 @@ void zram_pwb_resume(struct zram *zram)
 			   zram->pwb.native_resume_state);
 		atomic_set(&zram->pwb.gc_state, zram->pwb.gc_resume_state);
 	}
+	mutex_unlock(&zram->pwb.state_lock);
 }
 
 void zram_pwb_reset(struct zram *zram)
 {
 	struct zram_pwb_pack *pack;
-	unsigned long id;
 
 	mutex_lock(&zram->pwb.pack_lock);
-	xa_for_each(&zram->pwb.packs, id, pack) {
-		xa_erase(&zram->pwb.packs, id);
+	for (;;) {
+		XA_STATE(xas, &zram->pwb.packs, 0);
+		void *entry;
+
+		pack = NULL;
+		xa_lock(&zram->pwb.packs);
+		xas_for_each(&xas, entry, ULONG_MAX) {
+			xas_store(&xas, NULL);
+			if (xa_is_zero(entry))
+				continue;
+			pack = entry;
+			break;
+		}
+		xa_unlock(&zram->pwb.packs);
+		if (!pack)
+			break;
 		pack->in_table = false;
 		WARN_ON_ONCE(atomic_read(&pack->live_objects) ||
-			     atomic_read(&pack->readers));
+				     atomic_read(&pack->readers) ||
+				     atomic_read(&pack->publishers));
 		zram_pwb_pack_put(pack);
 	}
 	mutex_unlock(&zram->pwb.pack_lock);

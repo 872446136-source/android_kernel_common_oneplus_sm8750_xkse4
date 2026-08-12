@@ -1164,6 +1164,13 @@ unsigned int zs_lookup_class_index(struct zs_pool *pool, unsigned int size)
 {
 	struct size_class *class;
 
+	if (WARN_ON_ONCE(!size || size > ZS_MAX_ALLOC_SIZE))
+		return UINT_MAX;
+	/*
+	 * Keep this lookup identical to zs_malloc(): non-huge objects reserve
+	 * the handle at the front of their size-class chunk.
+	 */
+	size += ZS_HANDLE_SIZE;
 	class = pool->size_class[get_size_class_index(size)];
 
 	return class->index;

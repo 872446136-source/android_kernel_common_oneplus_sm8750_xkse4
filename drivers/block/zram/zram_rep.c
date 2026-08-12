@@ -16,6 +16,13 @@ static bool zram_rep_is_managed(enum zram_rep_type type)
 	       type == ZRAM_REP_DELTA || type == ZRAM_REP_PACKED_BACKING;
 }
 
+static struct zram_ext_rep *zram_rep_xa_load(struct zram *zram, u32 index)
+{
+	void *entry = xa_load(&zram->slot_ext, index);
+
+	return xa_is_value(entry) ? NULL : entry;
+}
+
 void zram_ext_rep_init(struct zram_ext_rep *ext, u64 identity,
 		       void (*release)(struct zram *, struct zram_ext_rep *))
 {
@@ -102,7 +109,8 @@ void zram_rep_reset(struct zram *zram)
 
 	xa_for_each(&zram->slot_ext, index, ext) {
 		xa_erase(&zram->slot_ext, index);
-		zram_ext_rep_put(zram, ext);
+		if (!xa_is_value(ext))
+			zram_ext_rep_put(zram, ext);
 	}
 	WARN_ON_ONCE(!xa_empty(&zram->slot_ext));
 	xa_destroy(&zram->slot_ext);
@@ -135,7 +143,7 @@ u64 zram_rep_mutation_seq_locked(struct zram *zram, u32 index)
 
 struct zram_ext_rep *zram_rep_extended_locked(struct zram *zram, u32 index)
 {
-	return xa_load(&zram->slot_ext, index);
+	return zram_rep_xa_load(zram, index);
 }
 
 bool zram_rep_allocated_locked(struct zram *zram, u32 index)
@@ -194,10 +202,27 @@ int zram_slot_txn_prepare(struct zram *zram, struct zram_slot_txn *txn,
 	if (ret)
 		return ret;
 	if (target_ext) {
-		ret = xa_reserve(&zram->slot_ext, txn->index, gfp);
-		if (ret)
-			return ret;
-		txn->xa_reserved = true;
+		void *stored;
+		void *token;
+
+		if (target_ext == txn->snapshot.ext)
+			return -EINVAL;
+		/*
+		 * An existing managed entry already provides a non-allocating
+		 * replacement path.  Ordinary -> managed transitions reserve the
+		 * exact slot with a transaction-owned token so concurrent prepares
+		 * cannot release each other's reservation.
+		 */
+		if (!txn->snapshot.ext) {
+			token = xa_mk_value((unsigned long)target_ext >> 2);
+			stored = xa_cmpxchg(&zram->slot_ext, txn->index, NULL,
+					    token, gfp);
+			if (xa_is_err(stored))
+				return xa_err(stored);
+			if (stored)
+				return -EAGAIN;
+			txn->xa_reservation = token;
+		}
 	}
 	txn->target_type = target_type;
 	txn->target_codec_id = target_codec_id;
@@ -208,25 +233,34 @@ int zram_slot_txn_prepare(struct zram *zram, struct zram_slot_txn *txn,
 	return 0;
 }
 
-bool zram_slot_txn_revalidate_locked(struct zram *zram,
-				     const struct zram_slot_txn *txn)
+static bool
+zram_slot_txn_revalidate_locked_common(struct zram *zram,
+				       const struct zram_slot_txn *txn,
+				       bool check_epoch)
 {
 	struct zram_representation rep;
 	struct zram_ext_rep *ext;
+	void *raw_ext;
 	u32 flags;
 
 	if (txn->state != ZRAM_TXN_SNAPSHOTTED &&
 	    txn->state != ZRAM_TXN_PREPARED)
 		return false;
 	rep = zram_representation_locked(zram, txn->index);
-	ext = zram_rep_extended_locked(zram, txn->index);
+	raw_ext = xa_load(&zram->slot_ext, txn->index);
+	ext = xa_is_value(raw_ext) ? NULL : raw_ext;
 	flags = zram->table[txn->index].attr.flags;
 
-	return rep.mutation_seq == txn->snapshot.rep.mutation_seq &&
+	return (!check_epoch ||
+		(u32)(rep.mutation_seq >> 32) ==
+		(u32)(txn->snapshot.rep.mutation_seq >> 32)) &&
+	       (u32)rep.mutation_seq ==
+		(u32)txn->snapshot.rep.mutation_seq &&
 	       rep.type == txn->snapshot.rep.type &&
 	       rep.codec_id == txn->snapshot.rep.codec_id &&
 	       rep.codec_generation == txn->snapshot.rep.codec_generation &&
-	       ext == txn->snapshot.ext &&
+	       (!txn->xa_reservation ? ext == txn->snapshot.ext :
+		raw_ext == txn->xa_reservation && !txn->snapshot.ext) &&
 	       (!ext || ext->identity == txn->snapshot.ext_identity) &&
 	       zram->table[txn->index].handle == txn->snapshot.handle &&
 	       (flags & (BIT(ZRAM_FLAG_SHIFT) - 1)) ==
@@ -235,10 +269,16 @@ bool zram_slot_txn_revalidate_locked(struct zram *zram,
 			txn->snapshot.identity_flags;
 }
 
-int zram_slot_txn_commit_if_current_locked(struct zram *zram,
-					   struct zram_slot_txn *txn,
-					   zram_slot_publish_t publish,
-					   void *private)
+bool zram_slot_txn_revalidate_locked(struct zram *zram,
+				     const struct zram_slot_txn *txn)
+{
+	return zram_slot_txn_revalidate_locked_common(zram, txn, true);
+}
+
+static int zram_slot_txn_commit_locked(struct zram *zram,
+				       struct zram_slot_txn *txn,
+				       zram_slot_publish_t publish,
+				       void *private, bool check_epoch)
 {
 	struct zram_slot_state *state;
 	struct zram_ext_rep *old_ext;
@@ -247,7 +287,7 @@ int zram_slot_txn_commit_if_current_locked(struct zram *zram,
 
 	if (txn->state != ZRAM_TXN_PREPARED)
 		return -EINVAL;
-	if (!zram_slot_txn_revalidate_locked(zram, txn))
+	if (!zram_slot_txn_revalidate_locked_common(zram, txn, check_epoch))
 		return -ESTALE;
 	if (txn->target_codec_id &&
 	    zram->codec_generation[txn->target_codec_id] !=
@@ -260,14 +300,16 @@ int zram_slot_txn_commit_if_current_locked(struct zram *zram,
 
 	old_ext = zram_rep_extended_locked(zram, txn->index);
 	if (txn->target_ext) {
-		stored = xa_store(&zram->slot_ext, txn->index,
-				  txn->target_ext, GFP_NOWAIT);
-		if (WARN_ON_ONCE(xa_is_err(stored))) {
+		void *expected = txn->xa_reservation ?: old_ext;
+
+		stored = xa_cmpxchg(&zram->slot_ext, txn->index, expected,
+				    txn->target_ext, GFP_NOWAIT);
+		if (xa_is_err(stored) || stored != expected) {
 			zram_codec_rep_put(zram, txn->target_codec_id);
-			return xa_err(stored);
+			return xa_is_err(stored) ? xa_err(stored) : -ESTALE;
 		}
 		txn->target_ext = NULL;
-		txn->xa_reserved = false;
+		txn->xa_reservation = NULL;
 	} else {
 		xa_erase(&zram->slot_ext, txn->index);
 	}
@@ -287,13 +329,105 @@ int zram_slot_txn_commit_if_current_locked(struct zram *zram,
 	return 0;
 }
 
+int zram_slot_txn_commit_if_current_locked(struct zram *zram,
+					   struct zram_slot_txn *txn,
+					   zram_slot_publish_t publish,
+					   void *private)
+{
+	return zram_slot_txn_commit_locked(zram, txn, publish, private, true);
+}
+
+int zram_slot_txn_commit_pair_if_current_locked(struct zram *zram,
+						struct zram_slot_txn *first,
+						zram_slot_publish_t first_publish,
+						void *first_private,
+						struct zram_slot_txn *second,
+						zram_slot_publish_t second_publish,
+						void *second_private)
+{
+	XA_STATE(first_xas, &zram->slot_ext, first->index);
+	XA_STATE(second_xas, &zram->slot_ext, second->index);
+	struct zram_slot_state *state;
+
+	/*
+	 * This specialized ordinary-to-managed pair commit is used for reference
+	 * promotion.  Both XArray nodes were reserved by their transactions, so
+	 * all fallible work finishes before either publish callback mutates a slot.
+	 */
+	if (first->index == second->index || !first_publish || !second_publish ||
+	    first->target_ext == second->target_ext ||
+	    first->target_type != ZRAM_REP_REF ||
+	    (second->target_type != ZRAM_REP_ALIAS &&
+	     second->target_type != ZRAM_REP_DELTA) ||
+	    (first->snapshot.rep.type != ZRAM_REP_RAW &&
+	     first->snapshot.rep.type != ZRAM_REP_COMPRESSED) ||
+	    (second->snapshot.rep.type != ZRAM_REP_RAW &&
+	     second->snapshot.rep.type != ZRAM_REP_COMPRESSED) ||
+	    first->target_codec_id != ZRAM_CODEC_NONE ||
+	    second->target_codec_id != ZRAM_CODEC_NONE)
+		return -EINVAL;
+	if (first->state != ZRAM_TXN_PREPARED ||
+	    second->state != ZRAM_TXN_PREPARED ||
+	    first->snapshot.ext || second->snapshot.ext ||
+	    !first->target_ext || !second->target_ext ||
+	    !first->xa_reservation || !second->xa_reservation ||
+	    !zram_slot_txn_revalidate_locked(zram, first) ||
+	    !zram_slot_txn_revalidate_locked(zram, second))
+		return -ESTALE;
+
+	/*
+	 * Validate both reservations under one XArray lock before replacing
+	 * either.  Replacing existing value entries cannot allocate, so after
+	 * this point publication has no rollback path and is pair-atomic.
+	 */
+	xa_lock(&zram->slot_ext);
+	if (xas_load(&first_xas) != first->xa_reservation ||
+	    xas_load(&second_xas) != second->xa_reservation) {
+		xa_unlock(&zram->slot_ext);
+		return -ESTALE;
+	}
+	WARN_ON_ONCE(xas_store(&first_xas, first->target_ext) !=
+		     first->xa_reservation);
+	WARN_ON_ONCE(xas_store(&second_xas, second->target_ext) !=
+		     second->xa_reservation);
+	xa_unlock(&zram->slot_ext);
+
+	first->target_ext = NULL;
+	first->xa_reservation = NULL;
+	second->target_ext = NULL;
+	second->xa_reservation = NULL;
+	if (first_publish)
+		first_publish(zram, first->index, &first->snapshot,
+			      first_private);
+	if (second_publish)
+		second_publish(zram, second->index, &second->snapshot,
+			       second_private);
+
+	state = zram_slot_state_locked(zram, first->index);
+	state->type = first->target_type;
+	state->codec_id = ZRAM_CODEC_NONE;
+	state->codec_generation = 0;
+	zram_advance_generation_locked(zram, first->index);
+	state = zram_slot_state_locked(zram, second->index);
+	state->type = second->target_type;
+	state->codec_id = ZRAM_CODEC_NONE;
+	state->codec_generation = 0;
+	zram_advance_generation_locked(zram, second->index);
+	zram_codec_rep_put(zram, first->snapshot.rep.codec_id);
+	zram_codec_rep_put(zram, second->snapshot.rep.codec_id);
+	first->state = ZRAM_TXN_COMMITTED;
+	second->state = ZRAM_TXN_COMMITTED;
+	return 0;
+}
+
 void zram_slot_txn_abort(struct zram *zram, struct zram_slot_txn *txn)
 {
 	if (!txn)
 		return;
-	if (txn->xa_reserved) {
-		xa_release(&zram->slot_ext, txn->index);
-		txn->xa_reserved = false;
+	if (txn->xa_reservation) {
+		xa_cmpxchg(&zram->slot_ext, txn->index,
+			   txn->xa_reservation, NULL, 0);
+		txn->xa_reservation = NULL;
 	}
 	if (txn->target_ext) {
 		zram_ext_rep_put(zram, txn->target_ext);

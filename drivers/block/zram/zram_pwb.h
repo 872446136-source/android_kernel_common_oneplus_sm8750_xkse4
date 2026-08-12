@@ -35,6 +35,8 @@ struct zram_pwb {
 	atomic_t state;
 	atomic_t native_state;
 	atomic_t gc_state;
+	/* Serializes sysfs, drain and teardown state transitions. */
+	struct mutex state_lock;
 	u8 resume_state;
 	u8 native_resume_state;
 	u8 gc_resume_state;
@@ -78,6 +80,11 @@ static inline void zram_pwb_fini(struct zram *zram) { }
 static inline void zram_pwb_quiesce(struct zram *zram) { }
 static inline void zram_pwb_resume(struct zram *zram) { }
 static inline bool zram_pwb_enabled(struct zram *zram) { return false; }
+static inline ssize_t zram_pwb_writeback(struct zram *zram, const char *buf,
+					 size_t len)
+{
+	return -EOPNOTSUPP;
+}
 static inline int zram_pwb_read(struct zram *zram, struct page *page,
 				const struct zram_slot_txn *txn)
 {

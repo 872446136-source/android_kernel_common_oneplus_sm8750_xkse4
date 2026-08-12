@@ -14,6 +14,14 @@
 
 #define ZRAM_ENGINE_DEFAULT_CPU_NS	(2ULL * NSEC_PER_MSEC)
 #define ZRAM_ENGINE_DEFAULT_PIN_BYTES	(16ULL * 1024 * 1024)
+#define ZRAM_ENGINE_DELTA_RESERVE	4U
+#define ZRAM_ENGINE_ID_PROBES		64U
+
+struct zram_delta_scratch {
+	u8 wire[PAGE_SIZE];
+	u8 workspace[PAGE_SIZE];
+};
+
 struct zram_sddc_ref {
 	refcount_t refs;
 	struct zram *zram;
@@ -59,7 +67,7 @@ static bool zram_engine_ordinary(u8 type)
 	return type == ZRAM_REP_RAW || type == ZRAM_REP_COMPRESSED;
 }
 
-static void zram_engine_ema_update(atomic64_t *ema, u64 sample)
+static void __maybe_unused zram_engine_ema_update(atomic64_t *ema, u64 sample)
 {
 	u64 old;
 	u64 next;
@@ -121,6 +129,7 @@ static bool zram_sddc_ref_get(struct zram_sddc_ref *reference)
 static void zram_sddc_ref_try_reap(struct zram_sddc_ref *reference)
 {
 	struct zram *zram = reference->zram;
+	XA_STATE(xas, &zram->engine.references, reference->id);
 	bool removed = false;
 
 	if (atomic_read(&reference->resident_refs) ||
@@ -131,7 +140,7 @@ static void zram_sddc_ref_try_reap(struct zram_sddc_ref *reference)
 	if (!atomic_read(&reference->resident_refs) &&
 	    !atomic_read(&reference->backing_refs) &&
 	    !atomic_read(&reference->reader_refs) &&
-	    __xa_load(&zram->engine.references, reference->id) == reference) {
+	    xas_load(&xas) == reference) {
 		__xa_erase(&zram->engine.references, reference->id);
 		WRITE_ONCE(reference->in_table, false);
 		removed = true;
@@ -159,10 +168,11 @@ static void zram_sddc_reader_put(struct zram_sddc_ref *reference)
 static struct zram_sddc_ref *
 zram_sddc_reference_lookup(struct zram *zram, u32 id, u32 generation)
 {
+	XA_STATE(xas, &zram->engine.references, id);
 	struct zram_sddc_ref *reference = NULL;
 
 	xa_lock(&zram->engine.references);
-	reference = __xa_load(&zram->engine.references, id);
+	reference = xas_load(&xas);
 	if (!reference || reference->generation != generation ||
 	    !zram_sddc_reader_get(reference))
 		reference = NULL;
@@ -178,7 +188,7 @@ zram_sddc_reference_create(struct zram *zram,
 			   u64 owner, u32 hash)
 {
 	struct zram_sddc_ref *reference;
-	void *stored;
+	u32 probes;
 	u32 id;
 	int ret;
 
@@ -204,24 +214,31 @@ zram_sddc_reference_create(struct zram *zram,
 	reference->codec_held = true;
 
 	mutex_lock(&zram->engine.reference_lock);
-	id = zram->engine.next_reference_id++;
-	if (unlikely(!id)) {
-		zram->engine.reference_generation++;
-		if (!zram->engine.reference_generation)
-			zram->engine.reference_generation++;
+	for (probes = 0; probes < ZRAM_ENGINE_ID_PROBES; probes++) {
 		id = zram->engine.next_reference_id++;
+		if (unlikely(!id)) {
+			zram->engine.reference_generation++;
+			if (!zram->engine.reference_generation)
+				zram->engine.reference_generation++;
+			id = zram->engine.next_reference_id++;
+		}
+		reference->id = id;
+		reference->generation = zram->engine.reference_generation;
+		WRITE_ONCE(reference->in_table, true);
+		ret = xa_insert(&zram->engine.references, id, reference,
+				GFP_NOIO);
+		if (ret)
+			WRITE_ONCE(reference->in_table, false);
+		if (ret != -EBUSY)
+			break;
 	}
-	reference->id = id;
-	reference->generation = zram->engine.reference_generation;
-	WRITE_ONCE(reference->in_table, true);
-	stored = xa_cmpxchg(&zram->engine.references, id, NULL, reference,
-			   GFP_KERNEL);
-	if (xa_is_err(stored) || stored) {
-		WRITE_ONCE(reference->in_table, false);
+	if (probes == ZRAM_ENGINE_ID_PROBES)
+		ret = -ENOSPC;
+	if (ret) {
 		mutex_unlock(&zram->engine.reference_lock);
 		zram_sddc_ref_put(reference);
 		zram_sddc_ref_put(reference);
-		return ERR_PTR(xa_is_err(stored) ? xa_err(stored) : -EEXIST);
+		return ERR_PTR(ret);
 	}
 	mutex_unlock(&zram->engine.reference_lock);
 	return reference;
@@ -336,9 +353,10 @@ int zram_engine_read_managed_locked(struct zram *zram, struct page *page,
 {
 	struct zram_sddc_ext *ext;
 	struct zram_ext_rep *base;
+	struct zram_delta_scratch *scratch = NULL;
 	struct page *reference_page = NULL;
 	struct lz4kd_delta_ctx ctx;
-	void *wire = NULL;
+	void *wire;
 	void *src;
 	void *dst;
 	int ret;
@@ -381,13 +399,16 @@ int zram_engine_read_managed_locked(struct zram *zram, struct page *page,
 	if (ext->kind != ZRAM_SDDC_WIRE_DELTA || !ext->wire_handle ||
 	    !ext->wire_size || ext->wire_size >= PAGE_SIZE)
 		return -EIO;
+	if (!zram->engine.delta_scratch_pool || !zram->engine.delta_page_pool)
+		return -EOPNOTSUPP;
 
-	reference_page = alloc_page(GFP_NOIO | __GFP_NOWARN);
-	wire = kmalloc(ext->wire_size, GFP_NOIO | __GFP_NOWARN);
-	if (!reference_page || !wire) {
+	scratch = mempool_alloc(zram->engine.delta_scratch_pool, GFP_NOIO);
+	reference_page = mempool_alloc(zram->engine.delta_page_pool, GFP_NOIO);
+	if (!scratch || !reference_page) {
 		ret = -ENOMEM;
 		goto out;
 	}
+	wire = scratch->wire;
 	ret = zram_sddc_ref_read(ext->reference, reference_page);
 	if (ret) {
 		atomic64_inc(&zram->engine.stats.sddc_decode_failures);
@@ -396,12 +417,13 @@ int zram_engine_read_managed_locked(struct zram *zram, struct page *page,
 		goto out;
 	}
 	src = zs_obj_read_begin(zram->mem_pool, ext->wire_handle,
-				ext->wire_size, NULL);
+				ext->wire_size, wire);
 	if (!src) {
 		ret = -EIO;
 		goto out;
 	}
-	memcpy(wire, src, ext->wire_size);
+	if (src != wire)
+		memcpy(wire, src, ext->wire_size);
 	zs_obj_read_end(zram->mem_pool, ext->wire_handle, ext->wire_size, src);
 	if (lz4kd_delta_hash(wire, ext->wire_size) != ext->integrity) {
 		ret = -EBADMSG;
@@ -412,9 +434,8 @@ int zram_engine_read_managed_locked(struct zram *zram, struct page *page,
 				   ext->reference_generation);
 	if (ret)
 		goto integrity;
-	ret = lz4kd_delta_ctx_init(&ctx, GFP_NOIO | __GFP_NOWARN);
-	if (ret)
-		goto out;
+	ctx.workspace = scratch->workspace;
+	ctx.workspace_size = PAGE_SIZE;
 	src = kmap_local_page(reference_page);
 	dst = kmap_local_page(page);
 	ret = lz4kd_delta_decode(&ctx, wire, ext->wire_size, src, PAGE_SIZE,
@@ -423,7 +444,6 @@ int zram_engine_read_managed_locked(struct zram *zram, struct page *page,
 		memset(dst, 0, PAGE_SIZE);
 	kunmap_local(dst);
 	kunmap_local(src);
-	lz4kd_delta_ctx_release(&ctx);
 	if (ret)
 		goto integrity;
 	goto out;
@@ -434,9 +454,10 @@ integrity:
 out:
 	if (ret)
 		memzero_page(page, 0, PAGE_SIZE);
-	kfree(wire);
+	if (scratch)
+		mempool_free(scratch, zram->engine.delta_scratch_pool);
 	if (reference_page)
-		__free_page(reference_page);
+		mempool_free(reference_page, zram->engine.delta_page_pool);
 	return ret;
 }
 
@@ -509,9 +530,9 @@ static void zram_sddc_index_insert(struct zram *zram, u32 index,
 	spin_unlock_irqrestore(&engine->index_lock, flags);
 }
 
-static u32 zram_sddc_index_candidates(struct zram *zram, u64 owner,
-				      u32 full_hash, u32 sample_hash,
-				      struct zram_sddc_cell *candidates)
+static u32 __maybe_unused
+zram_sddc_index_candidates(struct zram *zram, u64 owner, u32 full_hash,
+			   u32 sample_hash, struct zram_sddc_cell *candidates)
 {
 	struct zram_engine *engine = &zram->engine;
 	unsigned long flags;
@@ -578,8 +599,24 @@ static int zram_sddc_candidate_read(struct zram *zram,
 			goto out;
 		ext = container_of(base, struct zram_sddc_ext, base);
 	}
-	if (!ext || ext->kind != ZRAM_SDDC_WIRE_REF ||
-	    !zram_sddc_reader_get(ext->reference))
+	if (!ext || !ext->reference || ext->kind != ZRAM_SDDC_WIRE_REF ||
+	    ext->wire_handle || ext->wire_size)
+		goto out;
+	if (ext->reference_id != ext->reference->id ||
+	    ext->reference_generation != ext->reference->generation ||
+	    ext->owner != cell->owner ||
+	    ext->owner != ext->reference->owner ||
+	    !READ_ONCE(ext->reference->in_table)) {
+		atomic64_inc(&zram->engine.stats.sddc_cookie_mismatches);
+		goto out;
+	}
+	if (ext->integrity != ext->reference->hash ||
+	    !ext->reference->owns_payload || !ext->reference->handle ||
+	    ext->reference->logical_size != PAGE_SIZE) {
+		atomic64_inc(&zram->engine.stats.sddc_integrity_failures);
+		goto out;
+	}
+	if (!zram_sddc_reader_get(ext->reference))
 		goto out;
 	candidate->reference = ext->reference;
 	ret = zram_sddc_ref_read(ext->reference, page);
@@ -655,13 +692,16 @@ static int zram_sddc_commit_existing_ref(
 	struct zram_sddc_publish_target publish = {
 		.wire_handle = wire_handle,
 		.wire_size = wire_size,
-		.saved = target_txn->snapshot.obj_size - wire_size,
 		.kind = kind,
 	};
 	struct zram_sddc_ext *target_ext;
 	u8 target_type = kind == ZRAM_SDDC_WIRE_ALIAS ?
 		ZRAM_REP_ALIAS : ZRAM_REP_DELTA;
 	int ret;
+	u32 cost = wire_size + sizeof(struct zram_sddc_ext);
+
+	if (target_txn->snapshot.obj_size > cost)
+		publish.saved = target_txn->snapshot.obj_size - cost;
 
 	target_ext = zram_sddc_ext_create(zram, reference, kind, wire_handle,
 					  wire_size, integrity, owner);
@@ -703,7 +743,6 @@ static int zram_sddc_promote_and_commit(
 	struct zram_sddc_publish_target target_publish = {
 		.wire_handle = wire_handle,
 		.wire_size = wire_size,
-		.saved = target_txn->snapshot.obj_size - wire_size,
 		.kind = kind,
 	};
 	struct zram_sddc_ref *reference;
@@ -715,6 +754,11 @@ static int zram_sddc_promote_and_commit(
 	u32 second = max(source->index, target_txn->index);
 	bool created_here = false;
 	int ret;
+	u32 cost = wire_size + sizeof(struct zram_sddc_ref) +
+		   2 * sizeof(struct zram_sddc_ext);
+
+	if (target_txn->snapshot.obj_size > cost)
+		target_publish.saved = target_txn->snapshot.obj_size - cost;
 
 	reference = prepared_reference;
 	if (!reference) {
@@ -762,12 +806,13 @@ static int zram_sddc_promote_and_commit(
 		ret = -ESTALE;
 		goto out_unlock;
 	}
-	ret = zram_slot_txn_commit_if_current_locked(zram, &source->txn,
-				zram_sddc_publish_reference, reference);
-	if (WARN_ON_ONCE(ret))
-		goto out_unlock;
-	ret = zram_slot_txn_commit_if_current_locked(zram, target_txn,
-				zram_sddc_publish_target, &target_publish);
+	ret = zram_slot_txn_commit_pair_if_current_locked(zram,
+							  &source->txn,
+							  zram_sddc_publish_reference,
+							  reference,
+							  target_txn,
+							  zram_sddc_publish_target,
+							  &target_publish);
 	if (WARN_ON_ONCE(ret))
 		goto out_unlock;
 	WRITE_ONCE(job->generation,
@@ -792,12 +837,12 @@ free_wire:
 	return PTR_ERR(reference);
 }
 
-static int zram_sddc_try_candidate(struct zram *zram,
-				   struct zram_pp_job *job,
-				   struct zram_slot_txn *target_txn,
-				   struct page *target_page,
-				   const struct zram_sddc_cell *cell,
-				   u64 owner, u32 full_hash, u32 sample_hash)
+static int __maybe_unused
+zram_sddc_try_candidate(struct zram *zram, struct zram_pp_job *job,
+			struct zram_slot_txn *target_txn,
+			struct page *target_page,
+			const struct zram_sddc_cell *cell,
+			u64 owner, u32 full_hash, u32 sample_hash)
 {
 	struct zram_sddc_candidate source;
 	struct zram_sddc_ref *prepared_reference = NULL;
@@ -1011,11 +1056,11 @@ static int zram_engine_adaptive(struct zram *zram, struct zram_pp_job *job)
 	old_class = zs_lookup_class_index(zram->mem_pool,
 					 txn.snapshot.obj_size);
 	if (txn.snapshot.rep.codec_id) {
-		struct zcomp *current = zram_codec_by_id(zram,
-						txn.snapshot.rep.codec_id);
+		struct zcomp *current_comp = zram_codec_by_id(zram,
+						     txn.snapshot.rep.codec_id);
 
-		if (current)
-			current_exec = zcomp_execution_class(current);
+		if (current_comp)
+			current_exec = zcomp_execution_class(current_comp);
 	}
 
 	for (prio = 0; prio < ZRAM_MAX_COMPS; prio++) {
@@ -1257,13 +1302,24 @@ ssize_t zram_adaptive_state_show(struct zram *zram, char *buf)
 ssize_t zram_adaptive_state_store(struct zram *zram, const char *buf,
 				  size_t len)
 {
+	ssize_t ret = len;
+
+	mutex_lock(&zram->engine.state_lock);
+	if (atomic_read(&zram->engine.adaptive_state) ==
+	    ZRAM_FEATURE_QUIESCING ||
+	    READ_ONCE(zram->pp_scheduler.stopping)) {
+		ret = -ESHUTDOWN;
+		goto out;
+	}
 	if (sysfs_streq(buf, "1") || sysfs_streq(buf, "enabled"))
 		atomic_set(&zram->engine.adaptive_state, ZRAM_FEATURE_ENABLED);
 	else if (sysfs_streq(buf, "0") || sysfs_streq(buf, "disabled"))
 		atomic_set(&zram->engine.adaptive_state, ZRAM_FEATURE_DISABLED);
 	else
-		return -EINVAL;
-	return len;
+		ret = -EINVAL;
+out:
+	mutex_unlock(&zram->engine.state_lock);
+	return ret;
 }
 
 ssize_t zram_sddc_state_show(struct zram *zram, char *buf)
@@ -1279,24 +1335,39 @@ ssize_t zram_sddc_state_store(struct zram *zram, const char *buf, size_t len)
 	unsigned long nr_slots;
 	u32 index;
 	bool remaining = false;
+	ssize_t result = len;
 
+	mutex_lock(&zram->engine.state_lock);
+	if (atomic_read(&zram->engine.sddc_state) ==
+	    ZRAM_FEATURE_QUIESCING ||
+	    READ_ONCE(zram->pp_scheduler.stopping)) {
+		result = -ESHUTDOWN;
+		goto out;
+	}
 	if (sysfs_streq(buf, "1") || sysfs_streq(buf, "enabled")) {
 		if (PAGE_SIZE != LZ4KD_DELTA_PAGE_SIZE)
-			return -EOPNOTSUPP;
-		atomic_set(&zram->engine.sddc_state, ZRAM_FEATURE_ENABLED);
+			result = -EOPNOTSUPP;
+		else
+			atomic_set(&zram->engine.sddc_state,
+				   ZRAM_FEATURE_ENABLED);
 	} else if (sysfs_streq(buf, "0") || sysfs_streq(buf, "disabled"))
 		atomic_set(&zram->engine.sddc_state, ZRAM_FEATURE_DRAINING);
 	else if (sysfs_streq(buf, "drain")) {
 		atomic_set(&zram->engine.sddc_state, ZRAM_FEATURE_DRAINING);
 		operation = zram_pp_operation_begin(&zram->pp_scheduler,
 			ZRAM_PP_DEDUP, ZRAM_PP_PRIO_NORMAL, 0, 0);
-		if (IS_ERR(operation))
-			return PTR_ERR(operation);
+		if (IS_ERR(operation)) {
+			result = PTR_ERR(operation);
+			operation = NULL;
+			goto out;
+		}
 		flush_workqueue(zram->pp_scheduler.cpu_wq);
 		page = alloc_page(GFP_KERNEL | __GFP_NOWARN);
 		if (!page) {
 			zram_pp_operation_end(operation);
-			return -ENOMEM;
+			operation = NULL;
+			result = -ENOMEM;
+			goto out;
 		}
 		nr_slots = zram->disksize >> PAGE_SHIFT;
 		for (index = 0; index < nr_slots; index++) {
@@ -1331,10 +1402,12 @@ ssize_t zram_sddc_state_store(struct zram *zram, const char *buf, size_t len)
 			atomic_set(&zram->engine.sddc_state,
 				   ZRAM_FEATURE_DISABLED);
 		else
-			return -EBUSY;
+			result = -EBUSY;
 	} else
-		return -EINVAL;
-	return len;
+		result = -EINVAL;
+out:
+	mutex_unlock(&zram->engine.state_lock);
+	return result;
 }
 
 ssize_t zram_engine_stats_show(struct zram *zram, char *buf)
@@ -1443,13 +1516,14 @@ int zram_sddc_export_locked(struct zram *zram, u32 index, void *wire,
 		return -ENOSPC;
 	}
 	src = zs_obj_read_begin(zram->mem_pool, ext->wire_handle,
-				ext->wire_size, NULL);
+				ext->wire_size, wire);
 	if (!src) {
 		zram_sddc_reader_put(ext->reference);
 		export->reference_token = NULL;
 		return -EIO;
 	}
-	memcpy(wire, src, ext->wire_size);
+	if (src != wire)
+		memcpy(wire, src, ext->wire_size);
 	zs_obj_read_end(zram->mem_pool, ext->wire_handle, ext->wire_size, src);
 	if (lz4kd_delta_hash(wire, ext->wire_size) != ext->integrity ||
 	    lz4kd_delta_validate(wire, ext->wire_size, ext->reference_id,
@@ -1547,6 +1621,7 @@ int zram_engine_init(struct zram *zram)
 	atomic_set(&engine->sddc_state, ZRAM_FEATURE_DISABLED);
 	spin_lock_init(&engine->index_lock);
 	spin_lock_init(&engine->pin_lock);
+	mutex_init(&engine->state_lock);
 	mutex_init(&engine->reference_lock);
 	xa_init(&engine->references);
 	engine->next_reference_id = 1;
@@ -1554,13 +1629,23 @@ int zram_engine_init(struct zram *zram)
 	atomic64_set(&engine->next_ext_identity, 0);
 	engine->adaptive_cpu_limit_ns = ZRAM_ENGINE_DEFAULT_CPU_NS;
 	engine->backing_pin_limit_bytes = ZRAM_ENGINE_DEFAULT_PIN_BYTES;
+	if (IS_ENABLED(CONFIG_ZRAM_SDDC) && PAGE_SIZE == 4096) {
+		engine->delta_page_pool = mempool_create_page_pool
+			(ZRAM_ENGINE_DELTA_RESERVE, 0);
+		engine->delta_scratch_pool =
+			mempool_create_kmalloc_pool
+			(ZRAM_ENGINE_DELTA_RESERVE,
+			 sizeof(struct zram_delta_scratch));
+	}
 	engine->codec_perf = kvcalloc(ZRAM_MAX_CODECS + 1,
 				      sizeof(*engine->codec_perf), GFP_KERNEL);
 	engine->exact_index = kvcalloc(cells, sizeof(*engine->exact_index),
 				       GFP_KERNEL);
 	engine->sample_index = kvcalloc(cells, sizeof(*engine->sample_index),
 					GFP_KERNEL);
-	if (!engine->codec_perf || !engine->exact_index ||
+	if ((IS_ENABLED(CONFIG_ZRAM_SDDC) && PAGE_SIZE == 4096 &&
+	     (!engine->delta_page_pool || !engine->delta_scratch_pool)) ||
+	    !engine->codec_perf || !engine->exact_index ||
 	    !engine->sample_index) {
 		zram_engine_fini(zram);
 		return -ENOMEM;
@@ -1629,6 +1714,7 @@ void zram_engine_reset(struct zram *zram)
 
 void zram_engine_quiesce(struct zram *zram)
 {
+	mutex_lock(&zram->engine.state_lock);
 	if (atomic_read(&zram->engine.adaptive_state) !=
 	    ZRAM_FEATURE_QUIESCING)
 		zram->engine.adaptive_resume_state =
@@ -1638,10 +1724,12 @@ void zram_engine_quiesce(struct zram *zram)
 			atomic_read(&zram->engine.sddc_state);
 	atomic_set(&zram->engine.adaptive_state, ZRAM_FEATURE_QUIESCING);
 	atomic_set(&zram->engine.sddc_state, ZRAM_FEATURE_QUIESCING);
+	mutex_unlock(&zram->engine.state_lock);
 }
 
 void zram_engine_resume(struct zram *zram)
 {
+	mutex_lock(&zram->engine.state_lock);
 	if (!zram->disksize) {
 		atomic_set(&zram->engine.adaptive_state, ZRAM_FEATURE_DISABLED);
 		atomic_set(&zram->engine.sddc_state, ZRAM_FEATURE_DISABLED);
@@ -1649,18 +1737,23 @@ void zram_engine_resume(struct zram *zram)
 		atomic_set(&zram->engine.adaptive_state,
 			   zram->engine.adaptive_resume_state);
 		atomic_set(&zram->engine.sddc_state,
-			   zram->engine.sddc_resume_state);
+				   zram->engine.sddc_resume_state);
 	}
+	mutex_unlock(&zram->engine.state_lock);
 }
 
 void zram_engine_fini(struct zram *zram)
 {
 	zram_engine_reset(zram);
 	xa_destroy(&zram->engine.references);
+	mempool_destroy(zram->engine.delta_scratch_pool);
+	mempool_destroy(zram->engine.delta_page_pool);
 	kvfree(zram->engine.sample_index);
 	kvfree(zram->engine.exact_index);
 	kvfree(zram->engine.codec_perf);
 	zram->engine.sample_index = NULL;
 	zram->engine.exact_index = NULL;
 	zram->engine.codec_perf = NULL;
+	zram->engine.delta_scratch_pool = NULL;
+	zram->engine.delta_page_pool = NULL;
 }
