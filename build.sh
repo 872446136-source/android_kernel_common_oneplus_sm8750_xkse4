@@ -35,7 +35,7 @@ cat configs/resukisu.fragment \
 echo "[+] Build Kernel"
 
 
-build/build.sh
+./build/build.sh
 
 
 echo "[+] Build finished"
