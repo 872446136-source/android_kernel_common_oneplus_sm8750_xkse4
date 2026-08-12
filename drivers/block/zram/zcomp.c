@@ -71,11 +71,8 @@ static int zcomp_strm_init(struct zcomp *comp, struct zcomp_strm *zstrm)
 		return ret;
 
 	zstrm->local_copy = vzalloc(PAGE_SIZE);
-	/*
-	 * Keep one extra page so backends which add framing or padding can
-	 * report an oversized result and let ZRAM store the original page.
-	 */
-	zstrm->buffer = vzalloc(2 * PAGE_SIZE);
+	/* The backend ABI supplies the exact safe output capacity. */
+	zstrm->buffer = vzalloc(comp->buffer_size);
 	if (!zstrm->buffer || !zstrm->local_copy) {
 		zcomp_strm_free(comp, zstrm);
 		return -ENOMEM;
@@ -95,6 +92,62 @@ static const struct zcomp_ops *lookup_backend_ops(const char *comp)
 	return backends[i];
 }
 
+static int zcomp_validate_backend(const struct zcomp_ops *ops)
+{
+	u32 required = ZCOMP_CAP_COMPRESS | ZCOMP_CAP_DECOMPRESS |
+		       ZCOMP_CAP_PERCPU_CONTEXT | ZCOMP_CAP_BOUNDED_OUTPUT;
+	u32 supported = required | ZCOMP_CAP_PREPARED_PARAMS |
+			ZCOMP_CAP_4K_ONLY;
+	int i;
+
+	if (ops->abi_version != ZCOMP_BACKEND_ABI_VERSION ||
+	    !ops->name || !ops->name[0] ||
+	    ops->backend_id <= ZCOMP_BACKEND_INVALID ||
+	    ops->backend_id >= ZCOMP_BACKEND_MAX ||
+	    ops->exec_class >= ZCOMP_EXEC_MAX ||
+	    (ops->capabilities & required) != required ||
+	    ops->capabilities & ~supported ||
+	    ((ops->capabilities & ZCOMP_CAP_4K_ONLY) && PAGE_SHIFT != 12) ||
+	    ops->param_caps & ~(ZCOMP_PARAM_LEVEL |
+				ZCOMP_PARAM_DICTIONARY |
+				ZCOMP_PARAM_WINBITS) ||
+	    !ops->compress_bound || !ops->setup_params ||
+	    !ops->release_params || !ops->compress || !ops->decompress ||
+	    !ops->create_ctx || !ops->destroy_ctx)
+		return -EINVAL;
+	for (i = 0; backends[i]; i++) {
+		if (backends[i] == ops)
+			continue;
+		if (!backends[i]->name)
+			return -EINVAL;
+		if (backends[i]->backend_id == ops->backend_id ||
+		    !strcmp(backends[i]->name, ops->name))
+			return -EEXIST;
+	}
+
+	return 0;
+}
+
+static int zcomp_validate_backend_params(const struct zcomp_ops *ops,
+					 const struct zcomp_params *params)
+{
+	if (!params || params->drv_data ||
+	    (!!params->dict != !!params->dict_sz))
+		return -EINVAL;
+	if (!(ops->param_caps & ZCOMP_PARAM_LEVEL) &&
+	    params->level != ZCOMP_PARAM_NOT_SET)
+		return -EINVAL;
+	if (!(ops->param_caps & ZCOMP_PARAM_DICTIONARY) &&
+	    (params->dict || params->dict_sz))
+		return -EINVAL;
+	if (!(ops->param_caps & ZCOMP_PARAM_WINBITS) &&
+	    params->deflate.winbits != ZCOMP_PARAM_NOT_SET)
+		return -EINVAL;
+	if (ops->validate_params)
+		return ops->validate_params(params);
+	return 0;
+}
+
 const char *zcomp_lookup_backend_name(const char *comp)
 {
 	const struct zcomp_ops *backend = lookup_backend_ops(comp);
@@ -105,6 +158,20 @@ const char *zcomp_lookup_backend_name(const char *comp)
 bool zcomp_available_algorithm(const char *comp)
 {
 	return lookup_backend_ops(comp) != NULL;
+}
+
+int zcomp_validate_params(const char *comp,
+			  const struct zcomp_params *params)
+{
+	const struct zcomp_ops *ops = lookup_backend_ops(comp);
+	int ret;
+
+	if (!ops)
+		return -EINVAL;
+	ret = zcomp_validate_backend(ops);
+	if (ret)
+		return ret;
+	return zcomp_validate_backend_params(ops, params);
 }
 
 ssize_t zcomp_available_show(const char *comp, char *buf, ssize_t at)
@@ -152,14 +219,17 @@ int zcomp_compress(struct zcomp *comp, struct zcomp_strm *zstrm,
 		.src = src,
 		.src_len = PAGE_SIZE,
 		.dst = zstrm->buffer,
-		.dst_len = 2 * PAGE_SIZE,
+		.dst_len = comp->buffer_size,
 	};
 	int ret;
 
 	might_sleep();
 	ret = comp->ops->compress(comp->params, &zstrm->ctx, &req);
-	if (!ret)
-		*dst_len = req.dst_len;
+	if (ret)
+		return ret;
+	if (WARN_ON_ONCE(!req.dst_len || req.dst_len > comp->buffer_size))
+		return -EOVERFLOW;
+	*dst_len = req.dst_len;
 	return ret;
 }
 
@@ -202,7 +272,15 @@ int zcomp_cpu_dead(unsigned int cpu, struct hlist_node *node)
 
 static int zcomp_init(struct zcomp *comp, struct zcomp_params *params)
 {
+	size_t bound;
 	int ret, cpu;
+
+	ret = zcomp_validate_backend(comp->ops);
+	if (ret)
+		return ret;
+	ret = zcomp_validate_backend_params(comp->ops, params);
+	if (ret)
+		return ret;
 
 	comp->stream = alloc_percpu(struct zcomp_strm);
 	if (!comp->stream)
@@ -212,6 +290,13 @@ static int zcomp_init(struct zcomp *comp, struct zcomp_params *params)
 	ret = comp->ops->setup_params(params);
 	if (ret)
 		goto release_params;
+
+	bound = comp->ops->compress_bound(params, PAGE_SIZE);
+	if (bound < PAGE_SIZE || bound > 2 * PAGE_SIZE) {
+		ret = -EINVAL;
+		goto release_params;
+	}
+	comp->buffer_size = bound;
 
 	for_each_possible_cpu(cpu)
 		mutex_init(&per_cpu_ptr(comp->stream, cpu)->lock);
@@ -260,4 +345,29 @@ struct zcomp *zcomp_create(const char *alg, struct zcomp_params *params)
 		return ERR_PTR(ret);
 	}
 	return comp;
+}
+
+u8 zcomp_backend_id(const struct zcomp *comp)
+{
+	return comp->ops->backend_id;
+}
+
+u32 zcomp_capabilities(const struct zcomp *comp)
+{
+	return comp->ops->capabilities;
+}
+
+u32 zcomp_param_capabilities(const struct zcomp *comp)
+{
+	return comp->ops->param_caps;
+}
+
+enum zcomp_exec_class zcomp_execution_class(const struct zcomp *comp)
+{
+	return comp->ops->exec_class;
+}
+
+size_t zcomp_compress_bound(const struct zcomp *comp)
+{
+	return comp->buffer_size;
 }

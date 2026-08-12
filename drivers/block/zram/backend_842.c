@@ -6,6 +6,14 @@
 
 #include "backend_842.h"
 
+static size_t compress_bound_842(const struct zcomp_params *params,
+				 size_t src_len)
+{
+	if (src_len > SIZE_MAX / 2)
+		return SIZE_MAX;
+	return max_t(size_t, 64, 2 * src_len);
+}
+
 static void release_params_842(struct zcomp_params *params)
 {
 	params->drv_data = NULL;
@@ -60,11 +68,19 @@ static int decompress_842(struct zcomp_params *params, struct zcomp_ctx *ctx,
 }
 
 const struct zcomp_ops backend_842 = {
+	.abi_version	= ZCOMP_BACKEND_ABI_VERSION,
+	.backend_id	= ZCOMP_BACKEND_842,
+	.exec_class	= ZCOMP_EXEC_FAST,
+	.capabilities	= ZCOMP_CAP_COMPRESS | ZCOMP_CAP_DECOMPRESS |
+			  ZCOMP_CAP_PERCPU_CONTEXT |
+			  ZCOMP_CAP_BOUNDED_OUTPUT,
+	.param_caps	= 0,
+	.name		= "842",
+	.compress_bound	= compress_bound_842,
 	.compress	= compress_842,
 	.decompress	= decompress_842,
 	.create_ctx	= create_842,
 	.destroy_ctx	= destroy_842,
 	.setup_params	= setup_params_842,
 	.release_params	= release_params_842,
-	.name		= "842",
 };

@@ -13,22 +13,37 @@ struct lz4hc_ctx {
 	LZ4_streamHC_t *cstrm;
 };
 
+static size_t lz4hc_compress_bound(const struct zcomp_params *params,
+				   size_t src_len)
+{
+	return LZ4_compressBound(src_len);
+}
+
 static void lz4hc_release_params(struct zcomp_params *params)
 {
 	params->drv_data = NULL;
 }
 
-static int lz4hc_setup_params(struct zcomp_params *params)
+static int lz4hc_validate_params(const struct zcomp_params *params)
 {
-	if (params->deflate.winbits != ZCOMP_PARAM_NOT_SET ||
-	    params->dict_sz > INT_MAX || (!!params->dict != !!params->dict_sz))
+	if (params->dict_sz > INT_MAX)
 		return -EINVAL;
 
+	if (params->level != ZCOMP_PARAM_NOT_SET &&
+	    (params->level < LZ4HC_MIN_CLEVEL ||
+	     params->level > LZ4HC_MAX_CLEVEL))
+		return -EINVAL;
+	return 0;
+}
+
+static int lz4hc_setup_params(struct zcomp_params *params)
+{
+	int ret = lz4hc_validate_params(params);
+
+	if (ret)
+		return ret;
 	if (params->level == ZCOMP_PARAM_NOT_SET)
 		params->level = LZ4HC_DEFAULT_CLEVEL;
-	else if (params->level < LZ4HC_MIN_CLEVEL ||
-		 params->level > LZ4HC_MAX_CLEVEL)
-		return -EINVAL;
 	return 0;
 }
 
@@ -128,11 +143,20 @@ static int lz4hc_decompress(struct zcomp_params *params,
 }
 
 const struct zcomp_ops backend_lz4hc = {
+	.abi_version	= ZCOMP_BACKEND_ABI_VERSION,
+	.backend_id	= ZCOMP_BACKEND_LZ4HC,
+	.exec_class	= ZCOMP_EXEC_HIGH_RATIO,
+	.capabilities	= ZCOMP_CAP_COMPRESS | ZCOMP_CAP_DECOMPRESS |
+			  ZCOMP_CAP_PERCPU_CONTEXT |
+			  ZCOMP_CAP_BOUNDED_OUTPUT,
+	.param_caps	= ZCOMP_PARAM_LEVEL | ZCOMP_PARAM_DICTIONARY,
+	.name		= "lz4hc",
+	.compress_bound	= lz4hc_compress_bound,
+	.validate_params = lz4hc_validate_params,
 	.compress	= lz4hc_compress,
 	.decompress	= lz4hc_decompress,
 	.create_ctx	= lz4hc_create,
 	.destroy_ctx	= lz4hc_destroy,
 	.setup_params	= lz4hc_setup_params,
 	.release_params	= lz4hc_release_params,
-	.name		= "lz4hc",
 };

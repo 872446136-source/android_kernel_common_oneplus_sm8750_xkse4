@@ -21,6 +21,12 @@ struct zstd_params {
 	zstd_parameters cprm;
 };
 
+static size_t zstd_backend_compress_bound(const struct zcomp_params *params,
+					  size_t src_len)
+{
+	return zstd_compress_bound(src_len);
+}
+
 static void *zstd_custom_alloc(void *opaque, size_t size)
 {
 	return kvzalloc(size, GFP_NOIO | __GFP_NOWARN);
@@ -43,20 +49,25 @@ static void zstd_release_params(struct zcomp_params *params)
 	kfree(zp);
 }
 
+static int zstd_validate_params(const struct zcomp_params *params)
+{
+	if (params->level != ZCOMP_PARAM_NOT_SET &&
+	    (params->level < zstd_min_clevel() ||
+	     params->level > zstd_max_clevel()))
+		return -EINVAL;
+	return 0;
+}
+
 static int zstd_setup_params(struct zcomp_params *params)
 {
 	zstd_compression_parameters cparams;
 	struct zstd_params *zp;
 
-	if (params->deflate.winbits != ZCOMP_PARAM_NOT_SET ||
-	    (!!params->dict != !!params->dict_sz))
+	if (zstd_validate_params(params))
 		return -EINVAL;
 
 	if (params->level == ZCOMP_PARAM_NOT_SET)
 		params->level = zstd_default_clevel();
-	else if (params->level < zstd_min_clevel() ||
-		 params->level > zstd_max_clevel())
-		return -EINVAL;
 
 	zp = kzalloc(sizeof(*zp), GFP_KERNEL);
 	if (!zp)
@@ -193,11 +204,21 @@ static int zstd_decompress(struct zcomp_params *params, struct zcomp_ctx *ctx,
 }
 
 const struct zcomp_ops backend_zstd = {
+	.abi_version	= ZCOMP_BACKEND_ABI_VERSION,
+	.backend_id	= ZCOMP_BACKEND_ZSTD,
+	.exec_class	= ZCOMP_EXEC_HIGH_RATIO,
+	.capabilities	= ZCOMP_CAP_COMPRESS | ZCOMP_CAP_DECOMPRESS |
+			  ZCOMP_CAP_PERCPU_CONTEXT |
+			  ZCOMP_CAP_BOUNDED_OUTPUT |
+			  ZCOMP_CAP_PREPARED_PARAMS,
+	.param_caps	= ZCOMP_PARAM_LEVEL | ZCOMP_PARAM_DICTIONARY,
+	.name		= "zstd",
+	.compress_bound	= zstd_backend_compress_bound,
+	.validate_params = zstd_validate_params,
 	.compress	= zstd_compress,
 	.decompress	= zstd_decompress,
 	.create_ctx	= zstd_create,
 	.destroy_ctx	= zstd_destroy,
 	.setup_params	= zstd_setup_params,
 	.release_params	= zstd_release_params,
-	.name		= "zstd",
 };

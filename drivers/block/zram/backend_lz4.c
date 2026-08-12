@@ -13,10 +13,26 @@ struct lz4_ctx {
 	LZ4_stream_t *cstrm;
 };
 
+static size_t lz4_compress_bound(const struct zcomp_params *params,
+				 size_t src_len)
+{
+	return LZ4_compressBound(src_len);
+}
+
 static void lz4_release_params(struct zcomp_params *params)
 {
 	kfree(params->drv_data);
 	params->drv_data = NULL;
+}
+
+static int lz4_validate_params(const struct zcomp_params *params)
+{
+	if (params->dict_sz > INT_MAX)
+		return -EINVAL;
+	if (params->level != ZCOMP_PARAM_NOT_SET &&
+	    (params->level <= 0 || params->level > LZ4_ACCELERATION_MAX))
+		return -EINVAL;
+	return 0;
 }
 
 static int lz4_setup_params(struct zcomp_params *params)
@@ -24,15 +40,12 @@ static int lz4_setup_params(struct zcomp_params *params)
 	LZ4_stream_t *dict_stream;
 	int ret;
 
-	if (params->deflate.winbits != ZCOMP_PARAM_NOT_SET ||
-	    params->dict_sz > INT_MAX || (!!params->dict != !!params->dict_sz))
-		return -EINVAL;
+	ret = lz4_validate_params(params);
+	if (ret)
+		return ret;
 
 	if (params->level == ZCOMP_PARAM_NOT_SET)
 		params->level = LZ4_ACCELERATION_DEFAULT;
-	else if (params->level <= 0 ||
-		 params->level > LZ4_ACCELERATION_MAX)
-		return -EINVAL;
 
 	if (!params->dict)
 		return 0;
@@ -143,11 +156,21 @@ static int lz4_decompress(struct zcomp_params *params, struct zcomp_ctx *ctx,
 }
 
 const struct zcomp_ops backend_lz4 = {
+	.abi_version	= ZCOMP_BACKEND_ABI_VERSION,
+	.backend_id	= ZCOMP_BACKEND_LZ4,
+	.exec_class	= ZCOMP_EXEC_FAST,
+	.capabilities	= ZCOMP_CAP_COMPRESS | ZCOMP_CAP_DECOMPRESS |
+			  ZCOMP_CAP_PERCPU_CONTEXT |
+			  ZCOMP_CAP_BOUNDED_OUTPUT |
+			  ZCOMP_CAP_PREPARED_PARAMS,
+	.param_caps	= ZCOMP_PARAM_LEVEL | ZCOMP_PARAM_DICTIONARY,
+	.name		= "lz4",
+	.compress_bound	= lz4_compress_bound,
+	.validate_params = lz4_validate_params,
 	.compress	= lz4_compress,
 	.decompress	= lz4_decompress,
 	.create_ctx	= lz4_create,
 	.destroy_ctx	= lz4_destroy,
 	.setup_params	= lz4_setup_params,
 	.release_params	= lz4_release_params,
-	.name		= "lz4",
 };

@@ -22,6 +22,8 @@
 #include <linux/zsmalloc.h>
 
 #include "zcomp.h"
+#include "zram_pp.h"
+#include "zram_rep.h"
 
 #define SECTORS_PER_PAGE_SHIFT	(PAGE_SHIFT - SECTOR_SHIFT)
 #define SECTORS_PER_PAGE	(1 << SECTORS_PER_PAGE_SHIFT)
@@ -42,22 +44,13 @@
  */
 #define ZRAM_FLAG_SHIFT (PAGE_SHIFT + 1)
 
-/* Only 2 bits are allowed for comp priority index */
-#define ZRAM_COMP_PRIORITY_MASK	0x3
-
 /* Flags for zram pages (table[page_no].attr.flags) */
 enum zram_pageflags {
 	/* zram slot is locked */
 	ZRAM_LOCK = ZRAM_FLAG_SHIFT,
-	ZRAM_SAME,	/* Page consists the same element */
-	ZRAM_WB,	/* page is stored on backing_device */
-	ZRAM_PP_SLOT,	/* Selected for post-processing */
 	ZRAM_HUGE,	/* Incompressible page */
 	ZRAM_IDLE,	/* not accessed page since last idle marking */
 	ZRAM_INCOMPRESSIBLE, /* none of the algorithms could compress it */
-
-	ZRAM_COMP_PRIORITY_BIT1, /* First bit of comp priority index */
-	ZRAM_COMP_PRIORITY_BIT2, /* Second bit of comp priority index */
 
 	__NR_ZRAM_PAGEFLAGS,
 };
@@ -119,11 +112,19 @@ struct zram_stats {
 #define ZRAM_MAX_COMPS	1U
 #endif
 
+#define ZRAM_MAX_CODECS	ZRAM_MAX_COMPS
+
 struct zram {
 	struct zram_table_entry *table;
 	struct zs_pool *mem_pool;
-	struct zcomp *comps[ZRAM_MAX_COMPS];
+	/* Stable decoder instances, indexed by codec identity (zero is none). */
+	struct zcomp *codecs[ZRAM_MAX_CODECS + 1];
+	/* Mutable policy priority to stable codec identity mapping. */
+	u8 policy_codecs[ZRAM_MAX_COMPS];
 	struct zcomp_params params[ZRAM_MAX_COMPS];
+	struct xarray slot_meta;
+	atomic64_t mutation_seq;
+	struct zram_pp_scheduler pp_scheduler;
 	struct gendisk *disk;
 	/* Prevent concurrent execution of device init */
 	struct rw_semaphore init_lock;
@@ -144,9 +145,6 @@ struct zram {
 	 * zram is claimed so open request will be failed
 	 */
 	bool claim; /* Protected by disk->open_mutex */
-#if defined(CONFIG_ZRAM_WRITEBACK) || defined(CONFIG_ZRAM_MULTI_COMP)
-	atomic_t pp_in_progress;
-#endif
 #ifdef CONFIG_ZRAM_WRITEBACK
 	struct file *backing_dev;
 	bool wb_limit_enable;

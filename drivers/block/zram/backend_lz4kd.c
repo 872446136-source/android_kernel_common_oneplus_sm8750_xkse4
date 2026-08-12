@@ -2,10 +2,22 @@
 
 #include <linux/kernel.h>
 #include <linux/lz4kd.h>
-#include <linux/sizes.h>
 #include <linux/slab.h>
 
 #include "backend_lz4kd.h"
+
+static size_t lz4kd_compress_bound(const struct zcomp_params *params,
+				   size_t src_len)
+{
+	if (src_len > SIZE_MAX / 2)
+		return SIZE_MAX;
+	return 2 * src_len;
+}
+
+static int lz4kd_validate_params(const struct zcomp_params *params)
+{
+	return PAGE_SHIFT != 12 ? -EINVAL : 0;
+}
 
 static void lz4kd_release_params(struct zcomp_params *params)
 {
@@ -14,12 +26,7 @@ static void lz4kd_release_params(struct zcomp_params *params)
 
 static int lz4kd_setup_params(struct zcomp_params *params)
 {
-	if (PAGE_SIZE != SZ_4K ||
-	    params->level != ZCOMP_PARAM_NOT_SET || params->dict ||
-	    params->dict_sz ||
-	    params->deflate.winbits != ZCOMP_PARAM_NOT_SET)
-		return -EINVAL;
-	return 0;
+	return lz4kd_validate_params(params);
 }
 
 static int lz4kd_create(struct zcomp_params *params, struct zcomp_ctx *ctx)
@@ -62,11 +69,20 @@ static int lz4kd_decompress_backend(struct zcomp_params *params,
 }
 
 const struct zcomp_ops backend_lz4kd = {
+	.abi_version	= ZCOMP_BACKEND_ABI_VERSION,
+	.backend_id	= ZCOMP_BACKEND_LZ4KD,
+	.exec_class	= ZCOMP_EXEC_FAST,
+	.capabilities	= ZCOMP_CAP_COMPRESS | ZCOMP_CAP_DECOMPRESS |
+			  ZCOMP_CAP_PERCPU_CONTEXT |
+			  ZCOMP_CAP_BOUNDED_OUTPUT | ZCOMP_CAP_4K_ONLY,
+	.param_caps	= 0,
+	.name		= "lz4kd",
+	.compress_bound	= lz4kd_compress_bound,
+	.validate_params = lz4kd_validate_params,
 	.compress	= lz4kd_compress_backend,
 	.decompress	= lz4kd_decompress_backend,
 	.create_ctx	= lz4kd_create,
 	.destroy_ctx	= lz4kd_destroy,
 	.setup_params	= lz4kd_setup_params,
 	.release_params	= lz4kd_release_params,
-	.name		= "lz4kd",
 };

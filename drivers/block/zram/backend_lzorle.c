@@ -6,6 +6,12 @@
 
 #include "backend_lzorle.h"
 
+static size_t lzorle_compress_bound(const struct zcomp_params *params,
+				    size_t src_len)
+{
+	return lzo1x_worst_compress(src_len);
+}
+
 static void lzorle_release_params(struct zcomp_params *params)
 {
 	params->drv_data = NULL;
@@ -60,11 +66,19 @@ static int lzorle_decompress(struct zcomp_params *params,
 }
 
 const struct zcomp_ops backend_lzorle = {
+	.abi_version	= ZCOMP_BACKEND_ABI_VERSION,
+	.backend_id	= ZCOMP_BACKEND_LZO_RLE,
+	.exec_class	= ZCOMP_EXEC_FAST,
+	.capabilities	= ZCOMP_CAP_COMPRESS | ZCOMP_CAP_DECOMPRESS |
+			  ZCOMP_CAP_PERCPU_CONTEXT |
+			  ZCOMP_CAP_BOUNDED_OUTPUT,
+	.param_caps	= 0,
+	.name		= "lzo-rle",
+	.compress_bound	= lzorle_compress_bound,
 	.compress	= lzorle_compress,
 	.decompress	= lzorle_decompress,
 	.create_ctx	= lzorle_create,
 	.destroy_ctx	= lzorle_destroy,
 	.setup_params	= lzorle_setup_params,
 	.release_params	= lzorle_release_params,
-	.name		= "lzo-rle",
 };
