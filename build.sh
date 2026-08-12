@@ -32,8 +32,7 @@ echo "[+] Apply config"
 
 if [ -f configs/resukisu.fragment ]; then
 
-    cat configs/resukisu.fragment \
-    >> arch/arm64/configs/xkse4_dodge_defconfig
+    cat configs/resukisu.fragment >> arch/arm64/configs/xkse4_dodge_defconfig
 
 else
 
@@ -42,57 +41,90 @@ else
 fi
 
 
-echo "[+] Check build system"
+echo "[+] Check build environment"
 
 ls -la
 
-echo "==== check build directory ===="
+echo "=============================="
+echo " Search bazel tools"
+echo "=============================="
 
-ls -la build || true
+
+find . -maxdepth 3 \
+-name "bazel*" \
+-type f \
+| head -20
+
 
 
 echo "[+] Build Kernel"
 
 
-if command -v bazel >/dev/null 2>&1; then
 
-    echo "Using system bazel"
+# Android kernel Kleaf build
 
-    bazel build \
-    --config=fast \
-    --config=gki \
-    //common:kernel_aarch64
+if [ -f tools/bazel ]; then
 
+    echo "Using Android tools/bazel"
 
-elif [ -f tools/bazel ]; then
-
-    echo "Using tools/bazel"
 
     tools/bazel build \
     --config=fast \
-    --config=gki \
-    //common:kernel_aarch64
+    //:kernel_aarch64
+
+
+
+elif [ -f bazel/bazelisk.sh ]; then
+
+
+    echo "Using bazelisk"
+
+
+    bazel/bazelisk.sh build \
+    --config=fast \
+    //:kernel_aarch64
+
 
 
 else
 
-    echo "Bazel not found"
 
-    echo "Try Make build"
-
-    make \
-    O=out \
-    ARCH=arm64 \
-    xkse4_dodge_defconfig
+    echo "No bazel wrapper"
 
 
-    make \
-    O=out \
-    ARCH=arm64 \
-    LLVM=1 \
-    -j$(nproc)
+    echo "Using GKI build.sh"
+
+
+    if [ -f build/build.sh ]; then
+
+
+        ./build/build.sh
+
+
+    else
+
+
+        echo "Fallback make build"
+
+
+        make \
+        O=out \
+        ARCH=arm64 \
+        xkse4_dodge_defconfig
+
+
+        make \
+        O=out \
+        ARCH=arm64 \
+        LLVM=1 \
+        -j$(nproc)
+
+
+    fi
+
 
 fi
+
 
 
 echo "=============================="
